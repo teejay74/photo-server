@@ -339,6 +339,17 @@ class GalleryDatabase:
             return {"status": "already_running", "visual": 0, "exact": 0}
         visual_updates: list[tuple[str, str]] = []
         exact_updates: list[tuple[str, str]] = []
+        visual_count = exact_count = 0
+
+        def flush(sql: str, updates: list[tuple[str, str]]) -> int:
+            if not updates:
+                return 0
+            with self.connect() as connection:
+                connection.executemany(sql, updates)
+            count = len(updates)
+            updates.clear()
+            return count
+
         try:
             with self.connect() as connection:
                 visual_rows = connection.execute(
@@ -361,6 +372,8 @@ class GalleryDatabase:
                     except Exception:
                         pass
                 visual_updates.append((fingerprint, row["id"]))
+                if len(visual_updates) >= 100:
+                    visual_count += flush("UPDATE photos SET perceptual_hash=? WHERE id=?", visual_updates)
             for row in exact_rows:
                 target = safe_join(self.root, row["path"])
                 fingerprint = ""
@@ -370,12 +383,12 @@ class GalleryDatabase:
                     except OSError:
                         pass
                 exact_updates.append((fingerprint, row["id"]))
-            if visual_updates or exact_updates:
-                with self.connect() as connection:
-                    connection.executemany("UPDATE photos SET perceptual_hash=? WHERE id=?", visual_updates)
-                    connection.executemany("UPDATE photos SET content_hash=? WHERE id=?", exact_updates)
-            result = {"status": "complete", "visual": len(visual_updates), "exact": len(exact_updates)}
-            if visual_updates or exact_updates:
+                if len(exact_updates) >= 100:
+                    exact_count += flush("UPDATE photos SET content_hash=? WHERE id=?", exact_updates)
+            visual_count += flush("UPDATE photos SET perceptual_hash=? WHERE id=?", visual_updates)
+            exact_count += flush("UPDATE photos SET content_hash=? WHERE id=?", exact_updates)
+            result = {"status": "complete", "visual": visual_count, "exact": exact_count}
+            if visual_count or exact_count:
                 print(f"Hash enrichment: {result}", flush=True)
             return result
         finally:
