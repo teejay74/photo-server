@@ -156,10 +156,15 @@ def image_metadata(path: Path, fallback: datetime, fallback_source: str) -> dict
 
 
 class GalleryDatabase:
-    def __init__(self, root: Path, database: Path, backup_dir: Path | None = None):
+    def __init__(self, root: Path, database: Path, backup_dir: Path | None = None,
+                 marker_file: str = ".photodom-storage"):
         self.root = root.resolve()
         self.database = database.resolve()
         self.backup_dir = (backup_dir or self.database.parent / "backups").resolve()
+        marker_file = marker_file.strip()
+        if not marker_file or Path(marker_file).name != marker_file or marker_file in {".", ".."}:
+            raise ValueError("Некорректное имя файла-маркера")
+        self.marker_file = marker_file
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.refresh_lock = threading.Lock()
@@ -167,6 +172,10 @@ class GalleryDatabase:
         self.last_scan = ""
         self._initialize()
         self.refresh()
+
+    def storage_available(self) -> bool:
+        """The marker distinguishes a mounted photo disk from an empty mount point."""
+        return self.root.is_dir() and (self.root / self.marker_file).is_file()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database, timeout=30)
@@ -239,6 +248,10 @@ class GalleryDatabase:
             connection.execute("CREATE INDEX IF NOT EXISTS photos_perceptual_hash_idx ON photos(perceptual_hash)")
 
     def refresh(self) -> dict:
+        if not self.storage_available():
+            result = {"status": "storage_unavailable", "marker": self.marker_file}
+            print(f"Index refresh skipped: storage marker {self.marker_file!r} is missing", file=sys.stderr, flush=True)
+            return result
         if not self.refresh_lock.acquire(blocking=False):
             return {"status": "already_running"}
         try:
@@ -335,6 +348,8 @@ class GalleryDatabase:
 
     def enrich_hashes(self) -> dict:
         """Fill missing visual hashes and exact hashes only for equal-size candidates."""
+        if not self.storage_available():
+            return {"status": "storage_unavailable", "visual": 0, "exact": 0}
         if not self.hash_lock.acquire(blocking=False):
             return {"status": "already_running", "visual": 0, "exact": 0}
         visual_updates: list[tuple[str, str]] = []
@@ -497,7 +512,12 @@ class GalleryDatabase:
                 "SELECT COUNT(*) total, COALESCE(SUM(type='image'),0) images, COALESCE(SUM(type='video'),0) videos, COALESCE(SUM(size),0) bytes, COALESCE(SUM(latitude IS NOT NULL AND longitude IS NOT NULL),0) located FROM photos"
             ).fetchone()
             updated = connection.execute("SELECT value FROM app_meta WHERE key='last_scan'").fetchone()
-        return {**dict(row), "updated": updated[0] if updated else self.last_scan}
+        return {
+            **dict(row),
+            "updated": updated[0] if updated else self.last_scan,
+            "storageAvailable": self.storage_available(),
+            "storageMarker": self.marker_file,
+        }
 
     def map_items(self) -> list[dict]:
         with self.connect() as connection:
@@ -907,9 +927,16 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            available = self.app.database.storage_available()
+            self.send_json(
+                {"status": "ok" if available else "storage_unavailable"},
+                HTTPStatus.OK if available else HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
         if not self.require_auth():
             return
-        parsed = urlparse(self.path)
         path, params = parsed.path, parse_qs(parsed.query)
         if path == "/api/photos":
             self.api_photos(params)
@@ -1074,7 +1101,8 @@ def main():
         parser.error(f"Каталог не найден: {photo_root}")
     backup_retention = max(1, int(os.getenv("PHOTO_BACKUP_RETENTION", "7")))
     backup_interval = max(1, int(os.getenv("PHOTO_BACKUP_INTERVAL", "24")))
-    database = GalleryDatabase(photo_root, Path(args.database), Path(args.backups))
+    marker_file = os.getenv("PHOTO_MARKER_FILE", ".photodom-storage")
+    database = GalleryDatabase(photo_root, Path(args.database), Path(args.backups), marker_file)
     export_dir = Path(args.database).resolve().parent / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
     server = GalleryServer((args.host, args.port), GalleryHandler)

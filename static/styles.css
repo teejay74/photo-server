@@ -19,6 +19,7 @@ main { padding:0 max(92px,clamp(14px,4vw,64px)) 80px clamp(14px,4vw,64px); max-w
 h1 { font-family:Georgia,"Times New Roman",serif; font-size:clamp(52px,8vw,124px); line-height:.86; letter-spacing:-.065em; margin:24px 0 34px; font-weight:400; max-width:1050px; }
 h1 em { color:var(--muted); font-weight:400; }
 .summary { color:var(--muted); margin:0; font-size:14px; }
+.summary.storage-warning { display:inline-block; padding:10px 13px; border:1px solid #76523a; border-radius:10px; color:#ffd0a6; background:#2b1d15; }
 .controls { padding:30px 0 22px; position:relative; }
 .filter-row { display:flex; align-items:center; justify-content:space-between; gap:20px; }
 .tabs { display:flex; gap:8px; }

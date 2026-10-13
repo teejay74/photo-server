@@ -13,6 +13,7 @@ services:
       PHOTO_HOST: 0.0.0.0
       PHOTO_PORT: 8080
       PHOTO_ROOT: /photos
+      PHOTO_MARKER_FILE: ${PHOTO_MARKER_FILE:-.photodom-storage}
       PHOTO_CACHE: /app/.cache
       PHOTO_DB: /app/data/gallery.db
       PHOTO_BACKUP_DIR: /app/backups

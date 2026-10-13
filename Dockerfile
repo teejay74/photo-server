@@ -8,6 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PHOTO_HOST=0.0.0.0 \
     PHOTO_PORT=8080 \
     PHOTO_ROOT=/photos \
+    PHOTO_MARKER_FILE=.photodom-storage \
     PHOTO_CACHE=/app/.cache \
     PHOTO_DB=/app/data/gallery.db \
     PHOTO_BACKUP_DIR=/app/backups
@@ -29,6 +30,6 @@ USER gallery
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
-    CMD ["python", "-c", "import http.client; c=http.client.HTTPConnection('127.0.0.1',8080,timeout=3); c.request('HEAD','/'); r=c.getresponse(); raise SystemExit(0 if r.status in (200,401) else 1)"]
+    CMD ["python", "-c", "import http.client; c=http.client.HTTPConnection('127.0.0.1',8080,timeout=3); c.request('GET','/health'); r=c.getresponse(); raise SystemExit(0 if r.status == 200 else 1)"]
 
 CMD ["python", "server.py"]

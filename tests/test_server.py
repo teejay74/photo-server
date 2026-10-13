@@ -17,6 +17,7 @@ class GalleryDatabaseTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "photos"
         self.root.mkdir()
+        (self.root / ".photodom-storage").write_text("PhotoDom storage\n")
         image = Image.new("RGB", (80, 60), "#829c45")
         exif = Image.Exif()
         exif[36867] = "2022:07:08 09:10:11"
@@ -81,6 +82,15 @@ class GalleryDatabaseTests(unittest.TestCase):
         self.assertEqual(gps_coordinate((55, 45, 0), "N"), 55.75)
         self.assertEqual(gps_coordinate((37, 37, 0), "W"), -37.6166667)
 
+    def test_missing_storage_marker_preserves_index(self):
+        (self.root / ".photodom-storage").unlink()
+        (self.root / "holiday.jpg").unlink()
+        result = self.database.refresh()
+        self.assertEqual(result["status"], "storage_unavailable")
+        _, total = self.database.query(0, 10, "", "all")
+        self.assertEqual(total, 2)
+        self.assertFalse(self.database.stats()["storageAvailable"])
+
     def test_http_api_auth_favorites_and_albums(self):
         server = GalleryServer(("127.0.0.1", 0), GalleryHandler)
         server.app = argparse.Namespace(
@@ -114,6 +124,8 @@ class GalleryDatabaseTests(unittest.TestCase):
         try:
             status, _ = request("GET", "/api/stats", authenticated=False)
             self.assertEqual(status, 401)
+            status, data = request("GET", "/health", authenticated=False)
+            self.assertEqual((status, data["status"]), (200, "ok"))
             status, data = request("GET", "/api/photos?limit=10&type=image")
             self.assertEqual(status, 200)
             photo_id = data["items"][0]["id"]

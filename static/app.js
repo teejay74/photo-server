@@ -353,7 +353,11 @@ async function initialize(){
   try{
     await importBrowserFavorites();
     const [stats,timeline]=await Promise.all([api('/api/stats'),api('/api/timeline'),fetchAlbums()]);
-    document.querySelector('#summary').textContent=`${stats.images.toLocaleString('ru-RU')} фотографий · ${stats.videos.toLocaleString('ru-RU')} видео · ${stats.located.toLocaleString('ru-RU')} на карте`;
+    const summary=document.querySelector('#summary');
+    summary.textContent=stats.storageAvailable
+      ? `${stats.images.toLocaleString('ru-RU')} фотографий · ${stats.videos.toLocaleString('ru-RU')} видео · ${stats.located.toLocaleString('ru-RU')} на карте`
+      : `Хранилище недоступно: не найден файл ${stats.storageMarker}. Индекс сохранён, фотографии не удалены.`;
+    summary.classList.toggle('storage-warning',!stats.storageAvailable);
     state.timeline=timeline.years; renderTimeline();
   }catch(error){ toast(error.message); }
   load();
