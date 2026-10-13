@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0d0e10">
+  <title>Мои фотографии</title>
+  <link rel="stylesheet" href="/static/styles.css?v=7">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="В начало">
+      <span class="brand-mark">◉</span><span>Мои фотографии</span>
+    </a>
+    <div class="header-actions">
+      <button class="icon-button" id="favoritesButton" title="Избранное" aria-label="Показать избранное">♡</button>
+      <button class="icon-button" id="searchButton" title="Поиск" aria-label="Открыть поиск">⌕</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <p class="eyebrow">ЛИЧНЫЙ АРХИВ</p>
+      <h1>Моменты,<br><em>которые остаются.</em></h1>
+      <p class="summary" id="summary">Загружаем вашу коллекцию…</p>
+    </section>
+
+    <section class="controls" aria-label="Фильтры">
+      <div class="search-wrap" id="searchWrap">
+        <span>⌕</span>
+        <input id="searchInput" type="search" placeholder="Название или дата…" autocomplete="off">
+        <kbd>Esc</kbd>
+      </div>
+      <div class="filter-row">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-type="all">Все</button>
+          <button class="tab" data-type="image">Фото</button>
+          <button class="tab" data-type="video">Видео</button>
+        </div>
+        <span class="result-count" id="resultCount"></span>
+      </div>
+      <button class="period-chip" id="periodChip" hidden><span id="periodLabel"></span><b aria-label="Сбросить период">×</b></button>
+    </section>
+
+    <section id="gallery" class="gallery" aria-live="polite"></section>
+    <div id="empty" class="empty" hidden><span>◌</span><h2>Ничего не найдено</h2><p>Попробуйте изменить поиск или фильтр.</p></div>
+    <div id="sentinel" class="sentinel"><span></span><span></span><span></span></div>
+  </main>
+
+  <aside class="timeline" id="timeline" aria-label="Быстрый переход по датам">
+    <button class="timeline-all active" id="timelineAll" title="Все годы">Все</button>
+    <div class="timeline-track"><div id="timelineYears"></div></div>
+  </aside>
+  <div class="month-picker" id="monthPicker" hidden></div>
+
+  <dialog id="viewer" class="viewer">
+    <div class="viewer-bar">
+      <div><strong id="viewerName"></strong><small id="viewerMeta"></small></div>
+      <div class="viewer-actions">
+        <button id="favoriteCurrent" aria-label="Добавить в избранное">♡</button>
+        <a id="downloadCurrent" aria-label="Скачать" title="Скачать">↓</a>
+        <button id="closeViewer" aria-label="Закрыть">×</button>
+      </div>
+    </div>
+    <button class="nav prev" id="prevItem" aria-label="Предыдущий">‹</button>
+    <div id="viewerStage" class="viewer-stage"></div>
+    <button class="nav next" id="nextItem" aria-label="Следующий">›</button>
+  </dialog>
+  <script src="/static/app.js?v=5" defer></script>
+</body>
+</html>

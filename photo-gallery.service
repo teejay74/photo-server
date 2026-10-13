@@ -1,0 +1,22 @@
+[Unit]
+Description=Private photo gallery
+After=network.target
+
+[Service]
+Type=simple
+User=photos
+Group=photos
+WorkingDirectory=/srv/photos/photo-web
+EnvironmentFile=/srv/photos/photo-web/.env
+ExecStart=/usr/bin/python3 /srv/photos/photo-web/server.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/srv/photos/xiaomi-13t/Camera
+ReadWritePaths=/srv/photos/photo-web/.cache
+
+[Install]
+WantedBy=multi-user.target
