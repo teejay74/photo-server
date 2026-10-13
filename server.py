@@ -128,7 +128,6 @@ def image_metadata(path: Path, fallback: datetime, fallback_source: str) -> dict
     try:
         with Image.open(path) as image:
             metadata["width"], metadata["height"] = image.size
-            metadata["perceptual_hash"] = difference_hash(image)
             exif = image.getexif()
             if not exif:
                 return metadata
@@ -160,10 +159,10 @@ class GalleryDatabase:
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.refresh_lock = threading.Lock()
+        self.hash_lock = threading.Lock()
         self.last_scan = ""
         self._initialize()
         self.refresh()
-        self.enrich_hashes()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database, timeout=30)
@@ -332,46 +331,51 @@ class GalleryDatabase:
 
     def enrich_hashes(self) -> dict:
         """Fill missing visual hashes and exact hashes only for equal-size candidates."""
+        if not self.hash_lock.acquire(blocking=False):
+            return {"status": "already_running", "visual": 0, "exact": 0}
         visual_updates: list[tuple[str, str]] = []
         exact_updates: list[tuple[str, str]] = []
-        with self.connect() as connection:
-            visual_rows = connection.execute(
-                "SELECT id,path FROM photos WHERE type='image' AND perceptual_hash IS NULL"
-            ).fetchall()
-            exact_rows = connection.execute(
-                """
-                SELECT p.id,p.path FROM photos p
-                JOIN (SELECT size FROM photos GROUP BY size HAVING COUNT(*)>1) candidates USING(size)
-                WHERE p.content_hash IS NULL
-                """
-            ).fetchall()
-        for row in visual_rows:
-            target = safe_join(self.root, row["path"])
-            fingerprint = ""
-            if target and target.is_file() and Image is not None:
-                try:
-                    with Image.open(target) as image:
-                        fingerprint = difference_hash(image)
-                except Exception:
-                    pass
-            visual_updates.append((fingerprint, row["id"]))
-        for row in exact_rows:
-            target = safe_join(self.root, row["path"])
-            fingerprint = ""
-            if target and target.is_file():
-                try:
-                    fingerprint = file_sha256(target)
-                except OSError:
-                    pass
-            exact_updates.append((fingerprint, row["id"]))
-        if visual_updates or exact_updates:
+        try:
             with self.connect() as connection:
-                connection.executemany("UPDATE photos SET perceptual_hash=? WHERE id=?", visual_updates)
-                connection.executemany("UPDATE photos SET content_hash=? WHERE id=?", exact_updates)
-        result = {"visual": len(visual_updates), "exact": len(exact_updates)}
-        if visual_updates or exact_updates:
-            print(f"Hash enrichment: {result}", flush=True)
-        return result
+                visual_rows = connection.execute(
+                    "SELECT id,path FROM photos WHERE type='image' AND perceptual_hash IS NULL"
+                ).fetchall()
+                exact_rows = connection.execute(
+                    """
+                    SELECT p.id,p.path FROM photos p
+                    JOIN (SELECT size FROM photos GROUP BY size HAVING COUNT(*)>1) candidates USING(size)
+                    WHERE p.content_hash IS NULL
+                    """
+                ).fetchall()
+            for row in visual_rows:
+                target = safe_join(self.root, row["path"])
+                fingerprint = ""
+                if target and target.is_file() and Image is not None:
+                    try:
+                        with Image.open(target) as image:
+                            fingerprint = difference_hash(image)
+                    except Exception:
+                        pass
+                visual_updates.append((fingerprint, row["id"]))
+            for row in exact_rows:
+                target = safe_join(self.root, row["path"])
+                fingerprint = ""
+                if target and target.is_file():
+                    try:
+                        fingerprint = file_sha256(target)
+                    except OSError:
+                        pass
+                exact_updates.append((fingerprint, row["id"]))
+            if visual_updates or exact_updates:
+                with self.connect() as connection:
+                    connection.executemany("UPDATE photos SET perceptual_hash=? WHERE id=?", visual_updates)
+                    connection.executemany("UPDATE photos SET content_hash=? WHERE id=?", exact_updates)
+            result = {"status": "complete", "visual": len(visual_updates), "exact": len(exact_updates)}
+            if visual_updates or exact_updates:
+                print(f"Hash enrichment: {result}", flush=True)
+            return result
+        finally:
+            self.hash_lock.release()
 
     @staticmethod
     def _filters(query: str, kind: str, year: int | None, month: int | None, favorite: bool,
@@ -592,6 +596,13 @@ class GalleryDatabase:
             ).fetchall()
             sizes = connection.execute("SELECT MIN(size) minimum,MAX(size) maximum FROM photos").fetchone()
         return {"cameras": [dict(row) for row in cameras], "sizes": dict(sizes)}
+
+    def hash_progress(self) -> dict:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) total,COALESCE(SUM(perceptual_hash IS NOT NULL),0) ready FROM photos WHERE type='image'"
+            ).fetchone()
+        return {"total": row["total"], "ready": row["ready"], "running": self.hash_lock.locked()}
 
     def photos_by_ids(self, photo_ids: list[str]) -> list[dict]:
         valid = list(dict.fromkeys(str(value) for value in photo_ids if PHOTO_ID.fullmatch(str(value))))
@@ -903,7 +914,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             groups = self.app.database.duplicate_groups(mode)
             for group in groups:
                 group["items"] = [self.photo_payload(item) for item in group["items"]]
-            self.send_json({"groups": groups, "mode": mode})
+            self.send_json({"groups": groups, "mode": mode, "index": self.app.database.hash_progress()})
             return
         if path == "/api/backups":
             self.send_json(self.app.database.backup_status())
@@ -1067,9 +1078,17 @@ def main():
             time.sleep(interval)
             try:
                 database.refresh()
-                database.enrich_hashes()
             except Exception as error:
                 print(f"Index refresh failed: {error}", file=sys.stderr, flush=True)
+
+    def enrich_hashes_periodically():
+        interval = max(60, int(os.getenv("PHOTO_SCAN_INTERVAL", "300")))
+        while True:
+            try:
+                database.enrich_hashes()
+            except Exception as error:
+                print(f"Hash enrichment failed: {error}", file=sys.stderr, flush=True)
+            time.sleep(interval)
 
     def backup_periodically():
         while True:
@@ -1082,6 +1101,7 @@ def main():
             time.sleep(3600)
 
     threading.Thread(target=refresh_periodically, name="photo-index-refresh", daemon=True).start()
+    threading.Thread(target=enrich_hashes_periodically, name="photo-hash-enrichment", daemon=True).start()
     threading.Thread(target=backup_periodically, name="photo-db-backup", daemon=True).start()
     print(f"Photo gallery: http://{args.host}:{args.port} ({database.stats()['total']} files)", flush=True)
     try:

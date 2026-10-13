@@ -300,7 +300,8 @@ async function openDuplicates(mode='exact'){
   const root=document.querySelector('#duplicateList'); root.innerHTML='<div class="album-empty">Ищем совпадения…</div>';
   try{
     const data=await api(`/api/duplicates?mode=${mode}`); root.innerHTML='';
-    if(!data.groups.length){ root.innerHTML='<div class="album-empty">Совпадений не найдено.</div>'; return; }
+    if(data.index?.ready<data.index?.total){ const progress=document.createElement('div'); progress.className='index-progress'; progress.textContent=`Индекс похожести создаётся в фоне: ${data.index.ready.toLocaleString('ru-RU')} из ${data.index.total.toLocaleString('ru-RU')}`; root.append(progress); }
+    if(!data.groups.length){ root.insertAdjacentHTML('beforeend','<div class="album-empty">Совпадений пока не найдено.</div>'); return; }
     for(const [index,group] of data.groups.entries()){
       const article=document.createElement('article'); article.className='duplicate-group';
       article.innerHTML=`<header><strong>Группа ${index+1}</strong><span>${group.count} файла · ${size(group.bytes)}</span></header><div class="duplicate-thumbs">${group.items.map(item=>`<figure><img src="${item.thumbUrl}" alt="${escapeHtml(item.name)}"><figcaption>${tileDate.format(new Date(item.taken))}<small>${escapeHtml(item.name)}</small></figcaption></figure>`).join('')}</div>`;
