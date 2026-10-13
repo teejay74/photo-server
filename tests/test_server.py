@@ -55,6 +55,28 @@ class GalleryDatabaseTests(unittest.TestCase):
         self.assertEqual(album_items[0]["albumIds"], [album["id"]])
         self.assertEqual(self.database.albums()[0]["count"], 1)
 
+        video = next(item for item in self.database.query(0, 10, "", "video")[0])
+        self.assertEqual(self.database.set_favorites([photo["id"], video["id"]], True), 2)
+        self.assertEqual(self.database.set_album_photos(album["id"], [photo["id"], video["id"]], True), 2)
+
+    def test_filters_duplicates_and_backup(self):
+        items, total = self.database.query(0, 10, "", "image", filters={"camera": "Test Camera", "gps": "no"})
+        self.assertEqual(total, 1)
+        self.assertEqual(items[0]["cameraModel"], "Test Camera")
+        options = self.database.filter_options()
+        self.assertEqual(options["cameras"][0]["value"], "Test Camera")
+
+        (self.root / "holiday-copy.jpg").write_bytes((self.root / "holiday.jpg").read_bytes())
+        self.database.refresh()
+        self.database.enrich_hashes()
+        groups = self.database.duplicate_groups("exact")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["count"], 2)
+
+        backup = self.database.create_backup(2)
+        self.assertTrue((self.database.backup_dir / backup["name"]).is_file())
+        self.assertEqual(len(self.database.backup_status()["backups"]), 1)
+
     def test_gps_conversion(self):
         self.assertEqual(gps_coordinate((55, 45, 0), "N"), 55.75)
         self.assertEqual(gps_coordinate((37, 37, 0), "W"), -37.6166667)
@@ -68,7 +90,10 @@ class GalleryDatabaseTests(unittest.TestCase):
             password="secret",
             thumbnail_slots=threading.Semaphore(1),
             database=self.database,
+            export_dir=Path(self.temporary.name) / "exports",
+            backup_retention=2,
         )
+        server.app.export_dir.mkdir()
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         port = server.server_address[1]
@@ -104,6 +129,18 @@ class GalleryDatabaseTests(unittest.TestCase):
             self.assertEqual((status, data["total"]), (200, 1))
             status, data = request("GET", "/api/albums")
             self.assertEqual((status, data["albums"][0]["count"]), (200, 1))
+            status, data = request("POST", "/api/favorites/bulk", {"photoIds": [photo_id], "favorite": True})
+            self.assertEqual((status, data["count"]), (200, 1))
+            status, data = request("POST", f"/api/albums/{album_id}/photos", {"photoIds": [photo_id], "included": True})
+            self.assertEqual((status, data["count"]), (200, 1))
+            status, data = request("GET", "/api/filters")
+            self.assertEqual((status, data["cameras"][0]["value"]), (200, "Test Camera"))
+            status, data = request("GET", "/api/duplicates?mode=exact")
+            self.assertEqual((status, data["groups"]), (200, []))
+            status, data = request("POST", "/api/backups", {})
+            self.assertEqual(status, 201)
+            status, _ = request("POST", "/api/download/zip", {"photoIds": [photo_id]})
+            self.assertEqual(status, 200)
         finally:
             server.shutdown()
             server.server_close()

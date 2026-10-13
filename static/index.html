@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d0e10">
   <title>ФотоДом</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-  <link rel="stylesheet" href="/static/styles.css?v=8">
+  <link rel="stylesheet" href="/static/styles.css?v=9">
 </head>
 <body>
   <header class="topbar">
@@ -14,8 +14,12 @@
       <span class="brand-mark">◉</span><span>Мои фотографии</span>
     </a>
     <div class="header-actions">
+      <button class="icon-button" id="todayButton" title="В этот день" aria-label="Фотографии в этот день">◷</button>
       <button class="icon-button" id="albumsButton" title="Альбомы" aria-label="Открыть альбомы">▣</button>
       <button class="icon-button" id="mapButton" title="Карта" aria-label="Открыть карту">⌖</button>
+      <button class="icon-button" id="duplicatesButton" title="Дубли" aria-label="Найти дубли">≋</button>
+      <button class="icon-button" id="filtersButton" title="Фильтры и резервные копии" aria-label="Открыть фильтры">☷</button>
+      <button class="icon-button" id="selectButton" title="Выбрать несколько" aria-label="Выбрать несколько фотографий">✓</button>
       <button class="icon-button" id="favoritesButton" title="Избранное" aria-label="Показать избранное">♡</button>
       <button class="icon-button" id="searchButton" title="Поиск" aria-label="Открыть поиск">⌕</button>
     </div>
@@ -95,8 +99,41 @@
     <div id="mapCanvas"></div>
   </dialog>
 
+  <dialog id="filtersDialog" class="panel-dialog compact-dialog">
+    <section class="panel-shell">
+      <header class="panel-header"><div><small>ТОЧНЫЙ ПОИСК</small><h2>Фильтры</h2></div><button data-close="filtersDialog" aria-label="Закрыть">×</button></header>
+      <form id="filtersForm" class="filters-form">
+        <label>С даты<input id="filterDateFrom" type="date"></label>
+        <label>По дату<input id="filterDateTo" type="date"></label>
+        <label class="wide">Камера<select id="filterCamera"><option value="">Любая камера</option></select></label>
+        <label>Геопозиция<select id="filterGps"><option value="">Неважно</option><option value="yes">Есть</option><option value="no">Нет</option></select></label>
+        <label>Размер от, МБ<input id="filterMin" type="number" min="0" step="0.1" placeholder="0"></label>
+        <label>Размер до, МБ<input id="filterMax" type="number" min="0" step="0.1" placeholder="без ограничения"></label>
+        <div class="form-actions wide"><button type="button" id="resetFilters">Сбросить</button><button type="submit">Применить</button></div>
+      </form>
+      <section class="backup-box"><div><strong>Резервные копии базы</strong><small id="backupStatus">Проверяем…</small></div><button id="backupNow">Создать сейчас</button></section>
+    </section>
+  </dialog>
+
+  <dialog id="duplicatesDialog" class="panel-dialog duplicates-dialog">
+    <section class="panel-shell">
+      <header class="panel-header"><div><small>БЕЗ УДАЛЕНИЯ ФАЙЛОВ</small><h2>Похожие фотографии</h2></div><button data-close="duplicatesDialog" aria-label="Закрыть">×</button></header>
+      <div class="duplicate-tabs"><button class="active" data-duplicate-mode="exact">Точные копии</button><button data-duplicate-mode="similar">Похожие кадры</button></div>
+      <p class="duplicate-note">Это только отчёт: приложение ничего не удаляет автоматически.</p>
+      <div id="duplicateList" class="duplicate-list"></div>
+    </section>
+  </dialog>
+
+  <div id="selectionBar" class="selection-bar" hidden>
+    <strong id="selectionCount">0 выбрано</strong>
+    <button id="selectFavorite">♥ В избранное</button>
+    <button id="selectAlbum">＋ В альбом</button>
+    <button id="selectDownload">↓ ZIP</button>
+    <button id="selectCancel">Отмена</button>
+  </div>
+
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
-  <script src="/static/app.js?v=6" defer></script>
+  <script src="/static/app.js?v=7" defer></script>
 </body>
 </html>

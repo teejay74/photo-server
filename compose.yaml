@@ -15,6 +15,9 @@ services:
       PHOTO_ROOT: /photos
       PHOTO_CACHE: /app/.cache
       PHOTO_DB: /app/data/gallery.db
+      PHOTO_BACKUP_DIR: /app/backups
+      PHOTO_BACKUP_INTERVAL: ${PHOTO_BACKUP_INTERVAL:-24}
+      PHOTO_BACKUP_RETENTION: ${PHOTO_BACKUP_RETENTION:-7}
       PHOTO_SCAN_INTERVAL: ${PHOTO_SCAN_INTERVAL:-300}
       PHOTO_USER: ${PHOTO_USER:-photos}
       PHOTO_PASSWORD: ${PHOTO_PASSWORD:?Set PHOTO_PASSWORD in .env}
@@ -25,6 +28,7 @@ services:
         read_only: true
       - thumbnail-cache:/app/.cache
       - gallery-data:/app/data
+      - gallery-backups:/app/backups
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -34,3 +38,4 @@ services:
 volumes:
   thumbnail-cache:
   gallery-data:
+  gallery-backups:

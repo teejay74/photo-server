@@ -13,8 +13,10 @@ import re
 import secrets
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -90,6 +92,25 @@ def gps_coordinate(values, reference) -> float | None:
         return None
 
 
+def difference_hash(image) -> str:
+    """Return a small visual fingerprint suitable for finding similar photos."""
+    grayscale = ImageOps.exif_transpose(image).convert("L").resize((9, 8), Image.Resampling.LANCZOS)
+    pixels = list(grayscale.getdata())
+    value = 0
+    for row in range(8):
+        for column in range(8):
+            value = (value << 1) | int(pixels[row * 9 + column] > pixels[row * 9 + column + 1])
+    return f"{value:016x}"
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def image_metadata(path: Path, fallback: datetime, fallback_source: str) -> dict:
     metadata = {
         "taken": fallback,
@@ -100,12 +121,14 @@ def image_metadata(path: Path, fallback: datetime, fallback_source: str) -> dict
         "camera_model": None,
         "latitude": None,
         "longitude": None,
+        "perceptual_hash": None,
     }
     if Image is None:
         return metadata
     try:
         with Image.open(path) as image:
             metadata["width"], metadata["height"] = image.size
+            metadata["perceptual_hash"] = difference_hash(image)
             exif = image.getexif()
             if not exif:
                 return metadata
@@ -130,14 +153,17 @@ def image_metadata(path: Path, fallback: datetime, fallback_source: str) -> dict
 
 
 class GalleryDatabase:
-    def __init__(self, root: Path, database: Path):
+    def __init__(self, root: Path, database: Path, backup_dir: Path | None = None):
         self.root = root.resolve()
         self.database = database.resolve()
+        self.backup_dir = (backup_dir or self.database.parent / "backups").resolve()
         self.database.parent.mkdir(parents=True, exist_ok=True)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.refresh_lock = threading.Lock()
         self.last_scan = ""
         self._initialize()
         self.refresh()
+        self.enrich_hashes()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database, timeout=30)
@@ -168,6 +194,8 @@ class GalleryDatabase:
                     camera_model TEXT,
                     latitude REAL,
                     longitude REAL,
+                    content_hash TEXT,
+                    perceptual_hash TEXT,
                     indexed_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS photos_taken_idx ON photos(taken DESC);
@@ -199,6 +227,13 @@ class GalleryDatabase:
                 );
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(photos)")}
+            if "content_hash" not in columns:
+                connection.execute("ALTER TABLE photos ADD COLUMN content_hash TEXT")
+            if "perceptual_hash" not in columns:
+                connection.execute("ALTER TABLE photos ADD COLUMN perceptual_hash TEXT")
+            connection.execute("CREATE INDEX IF NOT EXISTS photos_content_hash_idx ON photos(content_hash)")
+            connection.execute("CREATE INDEX IF NOT EXISTS photos_perceptual_hash_idx ON photos(perceptual_hash)")
 
     def refresh(self) -> dict:
         if not self.refresh_lock.acquire(blocking=False):
@@ -237,6 +272,7 @@ class GalleryDatabase:
                     "camera_model": None,
                     "latitude": None,
                     "longitude": None,
+                    "perceptual_hash": None,
                 }
                 taken = metadata.pop("taken")
                 changed.append(
@@ -263,11 +299,11 @@ class GalleryDatabase:
                         INSERT INTO photos (
                             id, path, name, type, size, mtime_ns, taken, date_source,
                             year, month, width, height, camera_make, camera_model,
-                            latitude, longitude, indexed_at
+                            latitude, longitude, content_hash, perceptual_hash, indexed_at
                         ) VALUES (
                             :id, :path, :name, :type, :size, :mtime_ns, :taken, :date_source,
                             :year, :month, :width, :height, :camera_make, :camera_model,
-                            :latitude, :longitude, :indexed_at
+                            :latitude, :longitude, NULL, :perceptual_hash, :indexed_at
                         )
                         ON CONFLICT(path) DO UPDATE SET
                             name=excluded.name, type=excluded.type, size=excluded.size,
@@ -276,6 +312,7 @@ class GalleryDatabase:
                             month=excluded.month, width=excluded.width, height=excluded.height,
                             camera_make=excluded.camera_make, camera_model=excluded.camera_model,
                             latitude=excluded.latitude, longitude=excluded.longitude,
+                            content_hash=NULL, perceptual_hash=excluded.perceptual_hash,
                             indexed_at=excluded.indexed_at
                         """,
                         changed,
@@ -293,8 +330,53 @@ class GalleryDatabase:
         finally:
             self.refresh_lock.release()
 
+    def enrich_hashes(self) -> dict:
+        """Fill missing visual hashes and exact hashes only for equal-size candidates."""
+        visual_updates: list[tuple[str, str]] = []
+        exact_updates: list[tuple[str, str]] = []
+        with self.connect() as connection:
+            visual_rows = connection.execute(
+                "SELECT id,path FROM photos WHERE type='image' AND perceptual_hash IS NULL"
+            ).fetchall()
+            exact_rows = connection.execute(
+                """
+                SELECT p.id,p.path FROM photos p
+                JOIN (SELECT size FROM photos GROUP BY size HAVING COUNT(*)>1) candidates USING(size)
+                WHERE p.content_hash IS NULL
+                """
+            ).fetchall()
+        for row in visual_rows:
+            target = safe_join(self.root, row["path"])
+            fingerprint = ""
+            if target and target.is_file() and Image is not None:
+                try:
+                    with Image.open(target) as image:
+                        fingerprint = difference_hash(image)
+                except Exception:
+                    pass
+            visual_updates.append((fingerprint, row["id"]))
+        for row in exact_rows:
+            target = safe_join(self.root, row["path"])
+            fingerprint = ""
+            if target and target.is_file():
+                try:
+                    fingerprint = file_sha256(target)
+                except OSError:
+                    pass
+            exact_updates.append((fingerprint, row["id"]))
+        if visual_updates or exact_updates:
+            with self.connect() as connection:
+                connection.executemany("UPDATE photos SET perceptual_hash=? WHERE id=?", visual_updates)
+                connection.executemany("UPDATE photos SET content_hash=? WHERE id=?", exact_updates)
+        result = {"visual": len(visual_updates), "exact": len(exact_updates)}
+        if visual_updates or exact_updates:
+            print(f"Hash enrichment: {result}", flush=True)
+        return result
+
     @staticmethod
-    def _filters(query: str, kind: str, year: int | None, month: int | None, favorite: bool, album: int | None):
+    def _filters(query: str, kind: str, year: int | None, month: int | None, favorite: bool,
+                 album: int | None, filters: dict | None = None, day: int | None = None,
+                 before_year: int | None = None):
         clauses: list[str] = []
         values: list = []
         if query.strip():
@@ -310,16 +392,44 @@ class GalleryDatabase:
         if month is not None:
             clauses.append("p.month=?")
             values.append(month)
+        if day is not None:
+            clauses.append("CAST(SUBSTR(p.taken,9,2) AS INTEGER)=?")
+            values.append(day)
+        if before_year is not None:
+            clauses.append("p.year<=?")
+            values.append(before_year)
         if favorite:
             clauses.append("EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id)")
         if album is not None:
             clauses.append("EXISTS(SELECT 1 FROM album_photos ap WHERE ap.photo_id=p.id AND ap.album_id=?)")
             values.append(album)
+        filters = filters or {}
+        if filters.get("camera"):
+            clauses.append("p.camera_model=?")
+            values.append(filters["camera"])
+        if filters.get("gps") == "yes":
+            clauses.append("p.latitude IS NOT NULL AND p.longitude IS NOT NULL")
+        elif filters.get("gps") == "no":
+            clauses.append("(p.latitude IS NULL OR p.longitude IS NULL)")
+        if filters.get("date_from"):
+            clauses.append("p.taken>=?")
+            values.append(filters["date_from"] + "T00:00:00")
+        if filters.get("date_to"):
+            clauses.append("p.taken<=?")
+            values.append(filters["date_to"] + "T23:59:59")
+        if filters.get("min_size") is not None:
+            clauses.append("p.size>=?")
+            values.append(filters["min_size"])
+        if filters.get("max_size") is not None:
+            clauses.append("p.size<=?")
+            values.append(filters["max_size"])
         return (" WHERE " + " AND ".join(clauses)) if clauses else "", values
 
     def query(self, offset: int, limit: int, query: str, kind: str, year: int | None = None,
-              month: int | None = None, favorite: bool = False, album: int | None = None) -> tuple[list[dict], int]:
-        where, values = self._filters(query, kind, year, month, favorite, album)
+              month: int | None = None, favorite: bool = False, album: int | None = None,
+              filters: dict | None = None, day: int | None = None,
+              before_year: int | None = None) -> tuple[list[dict], int]:
+        where, values = self._filters(query, kind, year, month, favorite, album, filters, day, before_year)
         select = """
             SELECT p.*,
                 EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
@@ -344,6 +454,8 @@ class GalleryDatabase:
         item["dateSource"] = item.pop("date_source")
         item.pop("mtime_ns", None)
         item.pop("indexed_at", None)
+        item.pop("content_hash", None)
+        item.pop("perceptual_hash", None)
         return item
 
     def timeline(self) -> list[dict]:
@@ -383,6 +495,26 @@ class GalleryDatabase:
             else:
                 connection.execute("DELETE FROM favorites WHERE photo_id=?", (photo_id,))
         return favorite
+
+    def set_favorites(self, photo_ids: list[str], favorite: bool) -> int:
+        valid = list(dict.fromkeys(str(value) for value in photo_ids if PHOTO_ID.fullmatch(str(value))))
+        if not valid:
+            return 0
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        placeholders = ",".join("?" for _ in valid)
+        with self.connect() as connection:
+            found = [row[0] for row in connection.execute(
+                f"SELECT id FROM photos WHERE id IN ({placeholders})", valid
+            )]
+            if favorite:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO favorites(photo_id,created_at) VALUES(?,?)",
+                    ((photo_id, now) for photo_id in found),
+                )
+            elif found:
+                found_placeholders = ",".join("?" for _ in found)
+                connection.execute(f"DELETE FROM favorites WHERE photo_id IN ({found_placeholders})", found)
+        return len(found)
 
     def import_favorites(self, photo_ids: list[str]) -> int:
         valid = [value for value in photo_ids if PHOTO_ID.fullmatch(str(value))]
@@ -424,21 +556,156 @@ class GalleryDatabase:
             return connection.execute("DELETE FROM albums WHERE id=?", (album_id,)).rowcount > 0
 
     def set_album_photo(self, album_id: int, photo_id: str, included: bool) -> bool:
+        if not PHOTO_ID.fullmatch(photo_id) or not self.set_album_photos(album_id, [photo_id], included):
+            raise KeyError("photo")
+        return included
+
+    def set_album_photos(self, album_id: int, photo_ids: list[str], included: bool) -> int:
+        valid = list(dict.fromkeys(str(value) for value in photo_ids if PHOTO_ID.fullmatch(str(value))))
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         with self.connect() as connection:
             if not connection.execute("SELECT 1 FROM albums WHERE id=?", (album_id,)).fetchone():
                 raise KeyError("album")
-            if not connection.execute("SELECT 1 FROM photos WHERE id=?", (photo_id,)).fetchone():
-                raise KeyError("photo")
+            if not valid:
+                return 0
+            placeholders = ",".join("?" for _ in valid)
+            found = [row[0] for row in connection.execute(
+                f"SELECT id FROM photos WHERE id IN ({placeholders})", valid
+            )]
             if included:
-                connection.execute("INSERT OR IGNORE INTO album_photos(album_id,photo_id,added_at) VALUES(?,?,?)", (album_id, photo_id, now))
-            else:
-                connection.execute("DELETE FROM album_photos WHERE album_id=? AND photo_id=?", (album_id, photo_id))
-        return included
+                connection.executemany(
+                    "INSERT OR IGNORE INTO album_photos(album_id,photo_id,added_at) VALUES(?,?,?)",
+                    ((album_id, photo_id, now) for photo_id in found),
+                )
+            elif found:
+                found_placeholders = ",".join("?" for _ in found)
+                connection.execute(
+                    f"DELETE FROM album_photos WHERE album_id=? AND photo_id IN ({found_placeholders})",
+                    [album_id, *found],
+                )
+        return len(found)
+
+    def filter_options(self) -> dict:
+        with self.connect() as connection:
+            cameras = connection.execute(
+                "SELECT camera_model value,COUNT(*) count FROM photos WHERE camera_model IS NOT NULL AND camera_model!='' GROUP BY camera_model ORDER BY count DESC,value"
+            ).fetchall()
+            sizes = connection.execute("SELECT MIN(size) minimum,MAX(size) maximum FROM photos").fetchone()
+        return {"cameras": [dict(row) for row in cameras], "sizes": dict(sizes)}
+
+    def photos_by_ids(self, photo_ids: list[str]) -> list[dict]:
+        valid = list(dict.fromkeys(str(value) for value in photo_ids if PHOTO_ID.fullmatch(str(value))))
+        if not valid:
+            return []
+        placeholders = ",".join("?" for _ in valid)
+        select = """
+            SELECT p.*,
+                EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
+                (SELECT GROUP_CONCAT(ap.album_id) FROM album_photos ap WHERE ap.photo_id=p.id) AS album_ids
+            FROM photos p
+        """
+        with self.connect() as connection:
+            rows = connection.execute(f"{select} WHERE p.id IN ({placeholders})", valid).fetchall()
+        by_id = {row["id"]: self._photo(row) for row in rows}
+        return [by_id[photo_id] for photo_id in valid if photo_id in by_id]
+
+    def export_items(self, photo_ids: list[str]) -> list[dict]:
+        result = []
+        for item in self.photos_by_ids(photo_ids):
+            target = safe_join(self.root, item["path"])
+            if target and target.is_file():
+                result.append({**item, "target": target})
+        return result
+
+    def duplicate_groups(self, mode: str = "exact", limit: int = 100) -> list[dict]:
+        if mode == "exact":
+            with self.connect() as connection:
+                hashes = connection.execute(
+                    "SELECT content_hash,COUNT(*) count,SUM(size) bytes FROM photos WHERE content_hash IS NOT NULL AND content_hash!='' GROUP BY content_hash HAVING COUNT(*)>1 ORDER BY bytes DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                groups = []
+                for entry in hashes:
+                    rows = connection.execute(
+                        "SELECT * FROM photos WHERE content_hash=? ORDER BY taken DESC", (entry["content_hash"],)
+                    ).fetchall()
+                    groups.append({"kind": "exact", "count": entry["count"], "bytes": entry["bytes"], "items": [self._photo(row) for row in rows]})
+                return groups
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM photos WHERE type='image' AND perceptual_hash IS NOT NULL AND perceptual_hash!='' ORDER BY taken"
+            ).fetchall()
+        parents = list(range(len(rows)))
+
+        def find(value):
+            while parents[value] != value:
+                parents[value] = parents[parents[value]]
+                value = parents[value]
+            return value
+
+        def union(left, right):
+            left, right = find(left), find(right)
+            if left != right:
+                parents[right] = left
+
+        timestamps = [datetime.fromisoformat(row["taken"]).timestamp() for row in rows]
+        for left, row in enumerate(rows):
+            for right in range(left + 1, len(rows)):
+                if timestamps[right] - timestamps[left] > 600:
+                    break
+                other = rows[right]
+                if row["width"] and other["width"]:
+                    ratio = row["width"] / max(1, row["height"] or 1)
+                    other_ratio = other["width"] / max(1, other["height"] or 1)
+                    if abs(ratio - other_ratio) > 0.08:
+                        continue
+                distance = (int(row["perceptual_hash"], 16) ^ int(other["perceptual_hash"], 16)).bit_count()
+                if distance <= 6:
+                    union(left, right)
+        grouped: dict[int, list] = {}
+        for index, row in enumerate(rows):
+            grouped.setdefault(find(index), []).append(row)
+        result = [{
+            "kind": "similar", "count": len(members), "bytes": sum(row["size"] for row in members),
+            "items": [self._photo(row) for row in reversed(members)],
+        } for members in grouped.values() if len(members) > 1]
+        result.sort(key=lambda group: group["bytes"], reverse=True)
+        return result[:limit]
+
+    def create_backup(self, retention: int = 7) -> dict:
+        timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+        target = self.backup_dir / f"gallery-{timestamp}.db"
+        temporary = self.backup_dir / f".{target.name}.{os.getpid()}.tmp"
+        try:
+            with self.connect() as source, sqlite3.connect(temporary) as destination:
+                source.backup(destination)
+                integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != "ok":
+                    raise RuntimeError(f"SQLite integrity check: {integrity}")
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        backups = sorted(self.backup_dir.glob("gallery-*.db"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for old in backups[max(1, retention):]:
+            old.unlink(missing_ok=True)
+        return {"name": target.name, "created": datetime.fromtimestamp(target.stat().st_mtime).astimezone().isoformat(timespec="seconds"), "size": target.stat().st_size}
+
+    def backup_status(self) -> dict:
+        backups = sorted(self.backup_dir.glob("gallery-*.db"), key=lambda path: path.stat().st_mtime, reverse=True)
+        return {"backups": [{"name": path.name, "created": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"), "size": path.stat().st_size} for path in backups]}
+
+    def maybe_backup(self, max_age_hours: int = 24, retention: int = 7) -> dict | None:
+        backups = self.backup_status()["backups"]
+        if backups:
+            latest = datetime.fromisoformat(backups[0]["created"])
+            if (datetime.now().astimezone() - latest).total_seconds() < max_age_hours * 3600:
+                return None
+        return self.create_backup(retention)
 
 
 class GalleryHandler(BaseHTTPRequestHandler):
-    server_version = "PhotoGallery/2.0"
+    server_version = "PhotoGallery/3.0"
 
     @property
     def app(self):
@@ -488,7 +755,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             raise ValueError("Некорректный JSON")
 
-    def send_file(self, path: Path, content_type: str | None = None, download=False):
+    def send_file(self, path: Path, content_type: str | None = None, download=False, download_name: str | None = None):
         try:
             size = path.stat().st_size
         except OSError:
@@ -516,7 +783,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         if download:
-            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(path.name)}")
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(download_name or path.name)}")
         self.end_headers()
         if self.command == "HEAD":
             return
@@ -575,18 +842,36 @@ class GalleryHandler(BaseHTTPRequestHandler):
             limit = min(120, max(1, int(params.get("limit", ["60"])[0])))
             year = int(params["year"][0]) if params.get("year") else None
             month = int(params["month"][0]) if params.get("month") else None
+            day = int(params["day"][0]) if params.get("day") else None
+            before_year = int(params["before_year"][0]) if params.get("before_year") else None
             album = int(params["album"][0]) if params.get("album") else None
+            min_size = int(float(params["min_mb"][0]) * 1024 * 1024) if params.get("min_mb") else None
+            max_size = int(float(params["max_mb"][0]) * 1024 * 1024) if params.get("max_mb") else None
         except ValueError:
             self.send_json({"error": "Некорректные параметры"}, HTTPStatus.BAD_REQUEST)
             return
         if month is not None and month not in range(1, 13):
             self.send_json({"error": "Некорректный месяц"}, HTTPStatus.BAD_REQUEST)
             return
+        if day is not None and day not in range(1, 32):
+            self.send_json({"error": "Некорректный день"}, HTTPStatus.BAD_REQUEST)
+            return
         query = params.get("q", [""])[0][:100]
         kind = params.get("type", ["all"])[0]
         kind = kind if kind in {"all", "image", "video"} else "all"
         favorite = params.get("favorite", ["0"])[0] == "1"
-        items, total = self.app.database.query(offset, limit, query, kind, year, month, favorite, album)
+        gps = params.get("gps", [""])[0]
+        filters = {
+            "camera": params.get("camera", [""])[0][:120],
+            "gps": gps if gps in {"yes", "no"} else "",
+            "date_from": params.get("date_from", [""])[0][:10],
+            "date_to": params.get("date_to", [""])[0][:10],
+            "min_size": min_size,
+            "max_size": max_size,
+        }
+        items, total = self.app.database.query(
+            offset, limit, query, kind, year, month, favorite, album, filters, day, before_year
+        )
         payload = [self.photo_payload(item) for item in items]
         self.send_json({"items": payload, "total": total, "offset": offset, "hasMore": offset + len(payload) < total})
 
@@ -606,6 +891,22 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/stats":
             self.send_json(self.app.database.stats())
+            return
+        if path == "/api/filters":
+            self.send_json(self.app.database.filter_options())
+            return
+        if path == "/api/duplicates":
+            mode = params.get("mode", ["exact"])[0]
+            if mode not in {"exact", "similar"}:
+                self.send_json({"error": "Неизвестный режим"}, HTTPStatus.BAD_REQUEST)
+                return
+            groups = self.app.database.duplicate_groups(mode)
+            for group in groups:
+                group["items"] = [self.photo_payload(item) for item in group["items"]]
+            self.send_json({"groups": groups, "mode": mode})
+            return
+        if path == "/api/backups":
+            self.send_json(self.app.database.backup_status())
             return
         if path == "/api/map":
             items = []
@@ -652,6 +953,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 value = self.app.database.set_favorite(favorite_match.group(1), bool(body.get("favorite", True)))
                 self.send_json({"favorite": value})
                 return
+            if path == "/api/favorites/bulk":
+                count = self.app.database.set_favorites(body.get("photoIds", []), bool(body.get("favorite", True)))
+                self.send_json({"count": count, "favorite": bool(body.get("favorite", True))})
+                return
             if path == "/api/favorites/import":
                 count = self.app.database.import_favorites(body.get("photoIds", []))
                 self.send_json({"count": count})
@@ -663,6 +968,45 @@ class GalleryHandler(BaseHTTPRequestHandler):
             if album_photo_match:
                 included = self.app.database.set_album_photo(int(album_photo_match.group(1)), album_photo_match.group(2), bool(body.get("included", True)))
                 self.send_json({"included": included})
+                return
+            album_photos_match = re.fullmatch(r"/api/albums/(\d+)/photos", path)
+            if album_photos_match:
+                included = bool(body.get("included", True))
+                count = self.app.database.set_album_photos(int(album_photos_match.group(1)), body.get("photoIds", []), included)
+                self.send_json({"included": included, "count": count})
+                return
+            if path == "/api/backups":
+                backup = self.app.database.create_backup(self.app.backup_retention)
+                self.send_json(backup, HTTPStatus.CREATED)
+                return
+            if path == "/api/download/zip":
+                photo_ids = body.get("photoIds", [])
+                if not isinstance(photo_ids, list) or not photo_ids or len(photo_ids) > 500:
+                    self.send_json({"error": "Выберите от 1 до 500 файлов"}, HTTPStatus.BAD_REQUEST)
+                    return
+                items = self.app.database.export_items(photo_ids)
+                if not items:
+                    self.send_json({"error": "Файлы не найдены"}, HTTPStatus.NOT_FOUND)
+                    return
+                if sum(item["size"] for item in items) > 1024 ** 3:
+                    self.send_json({"error": "Архив ограничен размером 1 ГБ"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    return
+                temporary = tempfile.NamedTemporaryFile(prefix="photodom-", suffix=".zip", dir=self.app.export_dir, delete=False)
+                temporary.close()
+                archive_path = Path(temporary.name)
+                try:
+                    names: dict[str, int] = {}
+                    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                        for item in items:
+                            arcname = item["name"]
+                            names[arcname] = names.get(arcname, 0) + 1
+                            if names[arcname] > 1:
+                                stem, suffix = Path(arcname).stem, Path(arcname).suffix
+                                arcname = f"{stem}-{names[arcname]}{suffix}"
+                            archive.write(item["target"], arcname=arcname)
+                    self.send_file(archive_path, "application/zip", download=True, download_name="photodom-selection.zip")
+                finally:
+                    archive_path.unlink(missing_ok=True)
                 return
         except ValueError as error:
             self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
@@ -695,11 +1039,16 @@ def main():
     parser.add_argument("--photos", default=os.getenv("PHOTO_ROOT", "/srv/photos/xiaomi-13t/Camera"))
     parser.add_argument("--cache", default=os.getenv("PHOTO_CACHE", str(APP_DIR / ".cache")))
     parser.add_argument("--database", default=os.getenv("PHOTO_DB", str(APP_DIR / "data/gallery.db")))
+    parser.add_argument("--backups", default=os.getenv("PHOTO_BACKUP_DIR", str(APP_DIR / "backups")))
     args = parser.parse_args()
     photo_root = Path(args.photos).resolve()
     if not photo_root.is_dir():
         parser.error(f"Каталог не найден: {photo_root}")
-    database = GalleryDatabase(photo_root, Path(args.database))
+    backup_retention = max(1, int(os.getenv("PHOTO_BACKUP_RETENTION", "7")))
+    backup_interval = max(1, int(os.getenv("PHOTO_BACKUP_INTERVAL", "24")))
+    database = GalleryDatabase(photo_root, Path(args.database), Path(args.backups))
+    export_dir = Path(args.database).resolve().parent / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
     server = GalleryServer((args.host, args.port), GalleryHandler)
     server.app = argparse.Namespace(
         photo_root=photo_root,
@@ -708,6 +1057,8 @@ def main():
         password=os.getenv("PHOTO_PASSWORD", ""),
         thumbnail_slots=threading.Semaphore(2),
         database=database,
+        export_dir=export_dir,
+        backup_retention=backup_retention,
     )
 
     def refresh_periodically():
@@ -716,10 +1067,22 @@ def main():
             time.sleep(interval)
             try:
                 database.refresh()
+                database.enrich_hashes()
             except Exception as error:
                 print(f"Index refresh failed: {error}", file=sys.stderr, flush=True)
 
+    def backup_periodically():
+        while True:
+            try:
+                backup = database.maybe_backup(backup_interval, backup_retention)
+                if backup:
+                    print(f"SQLite backup: {backup['name']}", flush=True)
+            except Exception as error:
+                print(f"SQLite backup failed: {error}", file=sys.stderr, flush=True)
+            time.sleep(3600)
+
     threading.Thread(target=refresh_periodically, name="photo-index-refresh", daemon=True).start()
+    threading.Thread(target=backup_periodically, name="photo-db-backup", daemon=True).start()
     print(f"Photo gallery: http://{args.host}:{args.port} ({database.stats()['total']} files)", flush=True)
     try:
         server.serve_forever()
