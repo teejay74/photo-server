@@ -94,6 +94,10 @@ def gps_coordinate(values, reference) -> float | None:
 
 def difference_hash(image) -> str:
     """Return a small visual fingerprint suitable for finding similar photos."""
+    try:
+        image.draft("L", (64, 64))
+    except (AttributeError, OSError):
+        pass
     grayscale = ImageOps.exif_transpose(image).convert("L").resize((9, 8), Image.Resampling.LANCZOS)
     pixels = list(grayscale.get_flattened_data() if hasattr(grayscale, "get_flattened_data") else grayscale.getdata())
     value = 0
