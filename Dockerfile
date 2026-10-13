@@ -28,7 +28,7 @@ USER gallery
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
     CMD ["python", "-c", "import http.client; c=http.client.HTTPConnection('127.0.0.1',8080,timeout=3); c.request('HEAD','/'); r=c.getresponse(); raise SystemExit(0 if r.status in (200,401) else 1)"]
 
 CMD ["python", "server.py"]
