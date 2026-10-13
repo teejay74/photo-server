@@ -1,0 +1,10 @@
+.cache
+.env
+.git
+.gitignore
+.idea
+__pycache__
+*.log
+*.pid
+README.md
+photo-gallery.service

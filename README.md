@@ -2,7 +2,54 @@
 
 Минималистичный веб-интерфейс для локального каталога фотографий. Работает на Python 3, оригиналы не изменяет.
 
-## Запуск
+## Запуск в Docker
+
+На сервере должны быть установлены Docker Engine и Docker Compose. Клонируйте репозиторий и создайте локальный файл настроек:
+
+```bash
+git clone https://github.com/teejay74/photo-server.git
+cd photo-server
+cp .env.example .env
+```
+
+Откройте `.env` и задайте:
+
+- `PHOTO_DIR` — абсолютный путь к фотографиям на сервере;
+- `PHOTO_USER` и `PHOTO_PASSWORD` — данные для входа на сайт;
+- `APP_UID` и `APP_GID` — UID и GID владельца каталога фотографий.
+
+Например, если каталог принадлежит пользователю `photos`, значения можно узнать так:
+
+```bash
+id -u photos
+id -g photos
+```
+
+Защитите файл с паролем и запустите приложение:
+
+```bash
+chmod 600 .env
+docker compose up -d --build
+docker compose ps
+```
+
+После запуска галерея доступна по адресу `http://IP-СЕРВЕРА:8080`. Порт можно изменить через `WEB_PORT` в `.env`.
+
+Оригиналы подключаются к контейнеру только для чтения. Миниатюры сохраняются в отдельном Docker volume `thumbnail-cache`. Посмотреть журнал или остановить приложение можно командами:
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
+Обновление приложения:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+## Запуск без Docker
 
 ```bash
 export PHOTO_ROOT=/srv/photos/xiaomi-13t/Camera

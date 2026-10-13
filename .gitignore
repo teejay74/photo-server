@@ -1,5 +1,6 @@
 .cache/
 .env
+.idea/
 *.log
 *.pid
 __pycache__/

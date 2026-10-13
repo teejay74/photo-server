@@ -1,0 +1,32 @@
+services:
+  photo-gallery:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    environment:
+      PHOTO_HOST: 0.0.0.0
+      PHOTO_PORT: 8080
+      PHOTO_ROOT: /photos
+      PHOTO_CACHE: /app/.cache
+      PHOTO_USER: ${PHOTO_USER:-photos}
+      PHOTO_PASSWORD: ${PHOTO_PASSWORD:?Set PHOTO_PASSWORD in .env}
+    volumes:
+      - type: bind
+        source: ${PHOTO_DIR:-/srv/photos/xiaomi-13t/Camera}
+        target: /photos
+        read_only: true
+      - thumbnail-cache:/app/.cache
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  thumbnail-cache:
