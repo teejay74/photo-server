@@ -8,7 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PHOTO_HOST=0.0.0.0 \
     PHOTO_PORT=8080 \
     PHOTO_ROOT=/photos \
-    PHOTO_CACHE=/app/.cache
+    PHOTO_CACHE=/app/.cache \
+    PHOTO_DB=/app/data/gallery.db
 
 WORKDIR /app
 
@@ -20,7 +21,7 @@ RUN pip install --no-cache-dir --requirement requirements.txt \
 COPY --chown=gallery:gallery server.py ./server.py
 COPY --chown=gallery:gallery static ./static
 
-RUN mkdir -p /app/.cache && chown gallery:gallery /app/.cache
+RUN mkdir -p /app/.cache /app/data && chown gallery:gallery /app/.cache /app/data
 
 USER gallery
 

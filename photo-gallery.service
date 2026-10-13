@@ -8,6 +8,8 @@ User=photos
 Group=photos
 WorkingDirectory=/srv/photos/photo-web
 EnvironmentFile=/srv/photos/photo-web/.env
+Environment=PHOTO_DB=/var/lib/photo-gallery/gallery.db
+StateDirectory=photo-gallery
 ExecStart=/usr/bin/python3 /srv/photos/photo-web/server.py
 Restart=on-failure
 RestartSec=3

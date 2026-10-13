@@ -1,6 +1,10 @@
 .cache/
+data/
 .env
 .idea/
+*.db
+*.db-shm
+*.db-wal
 *.log
 *.pid
 __pycache__/

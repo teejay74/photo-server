@@ -4,8 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0d0e10">
-  <title>Мои фотографии</title>
-  <link rel="stylesheet" href="/static/styles.css?v=7">
+  <title>ФотоДом</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="/static/styles.css?v=8">
 </head>
 <body>
   <header class="topbar">
@@ -13,6 +14,8 @@
       <span class="brand-mark">◉</span><span>Мои фотографии</span>
     </a>
     <div class="header-actions">
+      <button class="icon-button" id="albumsButton" title="Альбомы" aria-label="Открыть альбомы">▣</button>
+      <button class="icon-button" id="mapButton" title="Карта" aria-label="Открыть карту">⌖</button>
       <button class="icon-button" id="favoritesButton" title="Избранное" aria-label="Показать избранное">♡</button>
       <button class="icon-button" id="searchButton" title="Поиск" aria-label="Открыть поиск">⌕</button>
     </div>
@@ -40,6 +43,7 @@
         <span class="result-count" id="resultCount"></span>
       </div>
       <button class="period-chip" id="periodChip" hidden><span id="periodLabel"></span><b aria-label="Сбросить период">×</b></button>
+      <button class="period-chip" id="collectionChip" hidden><span id="collectionLabel"></span><b aria-label="Сбросить коллекцию">×</b></button>
     </section>
 
     <section id="gallery" class="gallery" aria-live="polite"></section>
@@ -57,6 +61,7 @@
     <div class="viewer-bar">
       <div><strong id="viewerName"></strong><small id="viewerMeta"></small></div>
       <div class="viewer-actions">
+        <button id="albumCurrent" aria-label="Добавить в альбом" title="Добавить в альбом">＋</button>
         <button id="favoriteCurrent" aria-label="Добавить в избранное">♡</button>
         <a id="downloadCurrent" aria-label="Скачать" title="Скачать">↓</a>
         <button id="closeViewer" aria-label="Закрыть">×</button>
@@ -66,6 +71,32 @@
     <div id="viewerStage" class="viewer-stage"></div>
     <button class="nav next" id="nextItem" aria-label="Следующий">›</button>
   </dialog>
-  <script src="/static/app.js?v=5" defer></script>
+
+  <dialog id="albumsDialog" class="panel-dialog">
+    <section class="panel-shell">
+      <header class="panel-header"><div><small>КОЛЛЕКЦИИ</small><h2>Альбомы</h2></div><button data-close="albumsDialog" aria-label="Закрыть">×</button></header>
+      <form id="albumForm" class="album-form">
+        <input id="albumName" maxlength="80" placeholder="Название нового альбома" autocomplete="off">
+        <button type="submit">Создать</button>
+      </form>
+      <div id="albumList" class="album-list"></div>
+    </section>
+  </dialog>
+
+  <dialog id="albumPickerDialog" class="panel-dialog compact-dialog">
+    <section class="panel-shell">
+      <header class="panel-header"><div><small>ДОБАВИТЬ ФОТО</small><h2>Выберите альбом</h2></div><button data-close="albumPickerDialog" aria-label="Закрыть">×</button></header>
+      <div id="albumPickerList" class="album-picker-list"></div>
+    </section>
+  </dialog>
+
+  <dialog id="mapDialog" class="map-dialog">
+    <header class="map-header"><div><small>МЕСТА СЪЁМКИ</small><h2>Карта фотографий</h2><p id="mapStatus"></p></div><button data-close="mapDialog" aria-label="Закрыть">×</button></header>
+    <div id="mapCanvas"></div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
+  <script src="/static/app.js?v=6" defer></script>
 </body>
 </html>

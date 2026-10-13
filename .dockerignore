@@ -1,4 +1,5 @@
 .cache
+data
 .env
 .git
 .gitignore
@@ -6,5 +7,6 @@
 __pycache__
 *.log
 *.pid
+*.db*
 README.md
 photo-gallery.service
