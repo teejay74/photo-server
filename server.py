@@ -1092,7 +1092,12 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Cache-Control", "private, max-age=86400")
+        # Application assets must be revalidated after an update. Long-lived
+        # caching is safe only for photos, thumbnails and generated downloads.
+        if path.suffix.lower() in {".html", ".js", ".css"}:
+            self.send_header("Cache-Control", "no-store")
+        else:
+            self.send_header("Cache-Control", "private, max-age=86400")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_security_headers()
         if partial:
