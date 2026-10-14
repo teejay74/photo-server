@@ -1,6 +1,6 @@
 const state = {
-  items: [], total: 0, offset: 0, type: 'all', query: '', year: null, month: null,
-  timeline: [], albums: [], albumId: null, albumName: '', loading: false, hasMore: true,
+  items: [], total: 0, offset: 0, type: 'all', query: '', year: null, month: null, undated: false,
+  timeline: [], undatedCount: 0, albums: [], albumId: null, albumName: '', loading: false, hasMore: true,
   favoritesOnly: false, onThisDay: false, current: -1, controller: null, map: null, mapLayer: null,
   filters: {date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''},
   selecting: false, selected: new Set(), albumTargetIds: [], user: null, csrf: ''
@@ -45,6 +45,7 @@ async function load(reset=false){
   const params=new URLSearchParams({offset:state.offset,limit:60,type:state.type,q:state.query});
   if(state.year) params.set('year',state.year);
   if(state.month) params.set('month',state.month);
+  if(state.undated) params.set('undated','1');
   if(state.favoritesOnly) params.set('favorite','1');
   if(state.albumId) params.set('album',state.albumId);
   if(state.onThisDay){ const now=new Date(); params.set('month',now.getMonth()+1); params.set('day',now.getDate()); params.set('before_year',now.getFullYear()-1); }
@@ -66,15 +67,17 @@ async function load(reset=false){
 function render(){
   gallery.innerHTML=''; let lastMonth='';
   for(const item of state.items){
-    if(item.month!==lastMonth){
+    const isUndated=item.dateSource==='modified'; const group=isUndated?'undated':item.month;
+    if(group!==lastMonth){
       const title=document.createElement('div'); title.className='month-title';
-      title.innerHTML=`${months.format(new Date(item.taken))}<span>${item.month}</span>`; gallery.append(title); lastMonth=item.month;
+      title.innerHTML=isUndated?'Без даты<span>дата съёмки неизвестна</span>':`${months.format(new Date(item.taken))}<span>${item.month}</span>`; gallery.append(title); lastMonth=group;
     }
     const tile=document.createElement('figure'); tile.className='tile'+(state.selected.has(item.id)?' selected':''); tile.dataset.id=item.id;
     const visual=item.type==='image'
       ? `<img loading="lazy" src="${item.thumbUrl}" alt="${escapeHtml(item.name)}">`
       : `<video muted preload="metadata" src="${item.mediaUrl}#t=0.1"></video><span class="video-badge">▶</span>`;
-    tile.innerHTML=`${visual}<span class="selection-check">${state.selected.has(item.id)?'✓':''}</span>${item.favorite?'<span class="favorite-badge">♥</span>':''}<time class="tile-date" datetime="${item.taken}">${tileDate.format(new Date(item.taken))}</time><figcaption class="tile-overlay"><span class="tile-name">${escapeHtml(item.name)}</span><span>${size(item.size)}</span></figcaption>`;
+    const dateBadge=isUndated?'<span class="tile-date">Без даты</span>':`<time class="tile-date" datetime="${item.taken}">${tileDate.format(new Date(item.taken))}</time>`;
+    tile.innerHTML=`${visual}<span class="selection-check">${state.selected.has(item.id)?'✓':''}</span>${item.favorite?'<span class="favorite-badge">♥</span>':''}${dateBadge}<figcaption class="tile-overlay"><span class="tile-name">${escapeHtml(item.name)}</span><span>${size(item.size)}</span></figcaption>`;
     tile.addEventListener('click',()=>state.selecting?toggleSelection(item.id):openViewer(state.items.findIndex(value=>value.id===item.id)));
     tile.querySelector('img')?.addEventListener('load',event=>event.currentTarget.classList.add('loaded'));
     gallery.append(tile);
@@ -99,17 +102,20 @@ function renderCollectionState(){
 
 function renderTimeline(){
   const root=document.querySelector('#timelineYears'); root.innerHTML='';
-  document.querySelector('#timelineAll').classList.toggle('active',!state.year);
+  document.querySelector('#timelineAll').classList.toggle('active',!state.year&&!state.undated);
   for(const entry of state.timeline){
     const button=document.createElement('button'); button.className='timeline-year'+(state.year===entry.year?' active':'');
     button.textContent=entry.year; button.title=`${entry.year}: ${entry.count.toLocaleString('ru-RU')} файлов`;
     button.addEventListener('click',()=>selectYear(entry,button)); root.append(button);
   }
-  const chip=document.querySelector('#periodChip'); chip.hidden=!state.year;
-  if(state.year) document.querySelector('#periodLabel').textContent=state.month?`${monthNames[state.month-1]} ${state.year}`:`${state.year} год`;
+  const undated=document.querySelector('#timelineUndated'); undated.hidden=!state.undatedCount; undated.classList.toggle('active',state.undated); undated.title=`Без даты: ${state.undatedCount.toLocaleString('ru-RU')} файлов`;
+  const chip=document.querySelector('#periodChip'); chip.hidden=!state.year&&!state.undated;
+  if(state.undated) document.querySelector('#periodLabel').textContent='Без даты';
+  else if(state.year) document.querySelector('#periodLabel').textContent=state.month?`${monthNames[state.month-1]} ${state.year}`:`${state.year} год`;
 }
 
-function selectYear(entry,anchor){ state.year=entry.year; state.month=null; state.onThisDay=false; showMonths(entry,anchor); renderTimeline(); renderCollectionState(); load(true); }
+function selectYear(entry,anchor){ state.year=entry.year; state.month=null; state.undated=false; state.onThisDay=false; showMonths(entry,anchor); renderTimeline(); renderCollectionState(); load(true); }
+function selectUndated(){ state.year=null; state.month=null; state.undated=true; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; renderTimeline(); renderCollectionState(); load(true); }
 function showMonths(entry,anchor){
   const picker=document.querySelector('#monthPicker');
   picker.innerHTML=`<div class="month-picker-header"><strong>${entry.year}</strong><button aria-label="Закрыть">×</button></div><div class="month-grid"></div>`;
@@ -118,12 +124,12 @@ function showMonths(entry,anchor){
     if(!counts.has(number)) continue;
     const button=document.createElement('button'); button.className='month-button'+(state.month===number?' active':'');
     button.innerHTML=`${monthNames[number-1]}<small>${counts.get(number)}</small>`;
-    button.addEventListener('click',()=>{ state.year=entry.year; state.month=number; picker.hidden=true; renderTimeline(); load(true); }); grid.append(button);
+    button.addEventListener('click',()=>{ state.year=entry.year; state.month=number; state.undated=false; picker.hidden=true; renderTimeline(); load(true); }); grid.append(button);
   }
   picker.querySelector('.month-picker-header button').addEventListener('click',()=>picker.hidden=true);
   picker.hidden=false; const rect=anchor.getBoundingClientRect(); picker.style.top=`${Math.min(innerHeight-picker.offsetHeight-12,Math.max(74,rect.top-30))}px`;
 }
-function clearPeriod(){ state.year=null; state.month=null; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; renderTimeline(); renderCollectionState(); load(true); }
+function clearPeriod(){ state.year=null; state.month=null; state.undated=false; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; renderTimeline(); renderCollectionState(); load(true); }
 function clearCollection(){ state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false; state.filters={date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''}; renderCollectionState(); load(true); }
 
 function toggleSelection(id){
@@ -161,7 +167,7 @@ function openViewer(index){
   if(index<0||index>=state.items.length) return;
   state.current=index; const item=state.items[index];
   document.querySelector('#viewerName').textContent=item.name;
-  const metadata=[fullDate.format(new Date(item.taken)),size(item.size)];
+  const metadata=[item.dateSource==='modified'?'Дата съёмки неизвестна':fullDate.format(new Date(item.taken)),size(item.size)];
   if(item.width&&item.height) metadata.push(`${item.width}×${item.height}`);
   if(item.cameraModel) metadata.push(item.cameraModel);
   if(item.latitude!=null) metadata.push('есть геопозиция');
@@ -169,11 +175,19 @@ function openViewer(index){
   document.querySelector('#downloadCurrent').href='/download/'+item.path.split('/').map(encodeURIComponent).join('/');
   document.querySelector('#favoriteCurrent').textContent=item.favorite?'♥':'♡';
   document.querySelector('#albumCurrent').classList.toggle('active',item.albumIds.length>0);
+  stopViewerMedia();
   document.querySelector('#viewerStage').innerHTML=item.type==='image'
     ? `<img src="${item.mediaUrl}" alt="${escapeHtml(item.name)}">`
     : `<video src="${item.mediaUrl}" controls autoplay playsinline></video>`;
   if(!viewer.open) viewer.showModal();
 }
+
+function stopViewerMedia(){
+  const stage=document.querySelector('#viewerStage'); const video=stage.querySelector('video');
+  if(video){ video.pause(); video.removeAttribute('src'); video.load(); }
+  stage.replaceChildren();
+}
+function closeViewer(){ stopViewerMedia(); if(viewer.open) viewer.close(); }
 
 function move(direction){
   const next=state.current+direction;
@@ -365,7 +379,7 @@ document.querySelector('#favoritesButton').addEventListener('click',()=>{ state.
 document.querySelector('#albumsButton').addEventListener('click',async()=>{ try{ await fetchAlbums(); document.querySelector('#albumsDialog').showModal(); }catch(error){toast(error.message);} });
 document.querySelector('#mapButton').addEventListener('click',openMap);
 document.querySelector('#accountButton').addEventListener('click',openAccount);
-document.querySelector('#todayButton').addEventListener('click',()=>{ state.onThisDay=!state.onThisDay; state.year=null; state.month=null; state.albumId=null; state.albumName=''; state.favoritesOnly=false; renderTimeline(); renderCollectionState(); load(true); });
+document.querySelector('#todayButton').addEventListener('click',()=>{ state.onThisDay=!state.onThisDay; state.year=null; state.month=null; state.undated=false; state.albumId=null; state.albumName=''; state.favoritesOnly=false; renderTimeline(); renderCollectionState(); load(true); });
 document.querySelector('#duplicatesButton').addEventListener('click',()=>openDuplicates('exact'));
 document.querySelectorAll('[data-duplicate-mode]').forEach(button=>button.addEventListener('click',()=>openDuplicates(button.dataset.duplicateMode)));
 document.querySelector('#filtersButton').addEventListener('click',openFilters);
@@ -382,9 +396,10 @@ document.querySelector('#selectAlbum').addEventListener('click',async()=>{ try{ 
 document.querySelector('#selectDownload').addEventListener('click',downloadSelection);
 document.querySelector('#albumForm').addEventListener('submit',createAlbum);
 document.querySelector('#timelineAll').addEventListener('click',clearPeriod);
+document.querySelector('#timelineUndated').addEventListener('click',selectUndated);
 document.querySelector('#periodChip').addEventListener('click',clearPeriod);
 document.querySelector('#collectionChip').addEventListener('click',clearCollection);
-document.querySelector('#closeViewer').addEventListener('click',()=>viewer.close());
+document.querySelector('#closeViewer').addEventListener('click',closeViewer);
 document.querySelector('#prevItem').addEventListener('click',()=>move(-1));
 document.querySelector('#nextItem').addEventListener('click',()=>move(1));
 document.querySelector('#favoriteCurrent').addEventListener('click',toggleFavorite);
@@ -397,6 +412,7 @@ document.addEventListener('keydown',event=>{
   if(viewer.open&&event.key==='ArrowRight') move(1);
 });
 [viewer,...document.querySelectorAll('.panel-dialog')].forEach(dialog=>dialog.addEventListener('click',event=>{ if(event.target===dialog) dialog.close(); }));
+viewer.addEventListener('close',stopViewerMedia);
 new IntersectionObserver(entries=>{ if(entries[0].isIntersecting) load(); },{rootMargin:'600px'}).observe(sentinel);
 
 async function initialize(){
@@ -409,7 +425,7 @@ async function initialize(){
       ? `${stats.images.toLocaleString('ru-RU')} фотографий · ${stats.videos.toLocaleString('ru-RU')} видео · ${stats.located.toLocaleString('ru-RU')} на карте`
       : `Хранилище недоступно: не найден файл ${stats.storageMarker}. Индекс сохранён, фотографии не удалены.`;
     summary.classList.toggle('storage-warning',!stats.storageAvailable);
-    state.timeline=timeline.years; renderTimeline();
+    state.timeline=timeline.years; state.undatedCount=timeline.undated||0; renderTimeline();
   }catch(error){ toast(error.message); }
   load();
 }

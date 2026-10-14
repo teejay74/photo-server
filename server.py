@@ -636,7 +636,7 @@ class GalleryDatabase:
     @staticmethod
     def _filters(query: str, kind: str, year: int | None, month: int | None, favorite: bool,
                  album: int | None, filters: dict | None = None, day: int | None = None,
-                 before_year: int | None = None):
+                 before_year: int | None = None, undated: bool = False):
         clauses: list[str] = []
         values: list = []
         if query.strip():
@@ -658,6 +658,8 @@ class GalleryDatabase:
         if before_year is not None:
             clauses.append("p.year<=?")
             values.append(before_year)
+        if undated:
+            clauses.append("p.date_source='modified'")
         if favorite:
             clauses.append("EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id)")
         if album is not None:
@@ -688,8 +690,8 @@ class GalleryDatabase:
     def query(self, offset: int, limit: int, query: str, kind: str, year: int | None = None,
               month: int | None = None, favorite: bool = False, album: int | None = None,
               filters: dict | None = None, day: int | None = None,
-              before_year: int | None = None) -> tuple[list[dict], int]:
-        where, values = self._filters(query, kind, year, month, favorite, album, filters, day, before_year)
+              before_year: int | None = None, undated: bool = False) -> tuple[list[dict], int]:
+        where, values = self._filters(query, kind, year, month, favorite, album, filters, day, before_year, undated)
         select = """
             SELECT p.*,
                 EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
@@ -698,7 +700,10 @@ class GalleryDatabase:
         """
         with self.connect() as connection:
             total = connection.execute("SELECT COUNT(*) FROM photos p" + where, values).fetchone()[0]
-            rows = connection.execute(select + where + " ORDER BY p.taken DESC, p.name DESC LIMIT ? OFFSET ?", [*values, limit, offset]).fetchall()
+            rows = connection.execute(
+                select + where + " ORDER BY (p.date_source='modified') ASC, p.taken DESC, p.name DESC LIMIT ? OFFSET ?",
+                [*values, limit, offset],
+            ).fetchall()
         return [self._photo(row) for row in rows], total
 
     @staticmethod
@@ -721,7 +726,7 @@ class GalleryDatabase:
     def timeline(self) -> list[dict]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT year, month, COUNT(*) count FROM photos GROUP BY year, month ORDER BY year DESC, month DESC"
+                "SELECT year, month, COUNT(*) count FROM photos WHERE date_source!='modified' GROUP BY year, month ORDER BY year DESC, month DESC"
             ).fetchall()
         years: dict[int, dict] = {}
         for row in rows:
@@ -729,6 +734,10 @@ class GalleryDatabase:
             entry["count"] += row["count"]
             entry["months"].append({"month": row["month"], "count": row["count"]})
         return list(years.values())
+
+    def undated_count(self) -> int:
+        with self.connect() as connection:
+            return connection.execute("SELECT COUNT(*) FROM photos WHERE date_source='modified'").fetchone()[0]
 
     def stats(self) -> dict:
         with self.connect() as connection:
@@ -1189,6 +1198,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         kind = params.get("type", ["all"])[0]
         kind = kind if kind in {"all", "image", "video"} else "all"
         favorite = params.get("favorite", ["0"])[0] == "1"
+        undated = params.get("undated", ["0"])[0] == "1"
         gps = params.get("gps", [""])[0]
         filters = {
             "camera": params.get("camera", [""])[0][:120],
@@ -1199,7 +1209,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             "max_size": max_size,
         }
         items, total = self.app.database.query(
-            offset, limit, query, kind, year, month, favorite, album, filters, day, before_year
+            offset, limit, query, kind, year, month, favorite, album, filters, day, before_year, undated
         )
         payload = [self.photo_payload(item) for item in items]
         self.send_json({"items": payload, "total": total, "offset": offset, "hasMore": offset + len(payload) < total})
@@ -1243,7 +1253,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self.api_photos(params)
             return
         if path == "/api/timeline":
-            self.send_json({"years": self.app.database.timeline()})
+            self.send_json({"years": self.app.database.timeline(), "undated": self.app.database.undated_count()})
             return
         if path == "/api/stats":
             self.send_json(self.app.database.stats())

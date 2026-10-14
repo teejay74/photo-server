@@ -81,6 +81,16 @@ class GalleryDatabaseTests(unittest.TestCase):
         self.assertEqual(gps_coordinate((55, 45, 0), "N"), 55.75)
         self.assertEqual(gps_coordinate((37, 37, 0), "W"), -37.6166667)
 
+    def test_files_without_reliable_date_are_separated(self):
+        Image.new("RGB", (40, 30), "#334455").save(self.root / "old-scan.jpg")
+        self.database.refresh()
+        undated, total = self.database.query(0, 10, "", "all", undated=True)
+        self.assertEqual(total, 1)
+        self.assertEqual(undated[0]["name"], "old-scan.jpg")
+        self.assertEqual(undated[0]["dateSource"], "modified")
+        self.assertEqual(self.database.undated_count(), 1)
+        self.assertEqual(sum(entry["count"] for entry in self.database.timeline()), 2)
+
     def test_missing_storage_marker_preserves_index(self):
         (self.root / ".photodom-storage").unlink()
         (self.root / "holiday.jpg").unlink()
@@ -166,6 +176,8 @@ class GalleryDatabaseTests(unittest.TestCase):
             status, data, _ = request("GET", "/api/photos?limit=10&type=image")
             self.assertEqual(status, 200)
             photo_id = data["items"][0]["id"]
+            status, data, _ = request("GET", "/api/timeline")
+            self.assertEqual((status, data["undated"]), (200, 0))
 
             status, _, _ = request("POST", f"/api/favorites/{photo_id}", {"favorite": True}, csrf_protected=False)
             self.assertEqual(status, 403)
