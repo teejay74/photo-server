@@ -321,7 +321,10 @@ async function openMap(){
     const data=await api('/api/map'); status.textContent=`${data.items.length.toLocaleString('ru-RU')} фотографий с координатами`;
     if(!state.map){
       state.map=L.map('mapCanvas',{zoomControl:true});
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(state.map);
+      L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{
+        maxZoom:19,
+        attribution:'© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>'
+      }).addTo(state.map);
       state.mapLayer=L.layerGroup().addTo(state.map);
     }
     state.mapLayer.clearLayers(); const bounds=[];

@@ -1282,16 +1282,18 @@ class GalleryHandler(BaseHTTPRequestHandler):
 
     def send_security_headers(self):
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
+        # OpenStreetMap requires web clients to send an accurate origin in the
+        # Referer header. This still avoids exposing paths and query strings.
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; "
             "script-src 'self'; "
             "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: blob: https://*.tile.openstreetmap.org; "
+            "img-src 'self' data: blob: https://tile.openstreetmap.org; "
             "media-src 'self' blob:; "
-            "connect-src 'self' https://*.tile.openstreetmap.org; "
+            "connect-src 'self' https://tile.openstreetmap.org; "
             "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
         )
 
