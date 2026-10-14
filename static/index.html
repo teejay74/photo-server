@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d0e10">
   <title>ФотоДом</title>
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css?v=1.9.4">
-  <link rel="stylesheet" href="/static/styles.css?v=14">
+  <link rel="stylesheet" href="/static/styles.css?v=15">
 </head>
 <body>
   <header class="topbar">
@@ -102,6 +102,14 @@
   <dialog id="peopleDialog" class="panel-dialog people-dialog">
     <section class="panel-shell">
       <header class="panel-header"><div><small>ЛОКАЛЬНОЕ РАСПОЗНАВАНИЕ</small><h2>Люди</h2><p id="peopleProgress">Загружаем группы…</p></div><button data-close="peopleDialog" aria-label="Закрыть">×</button></header>
+      <div class="people-filter-bar">
+        <div class="people-mode" role="group" aria-label="Режим поиска людей">
+          <button type="button" data-people-mode="all">Все выбранные</button>
+          <button type="button" data-people-mode="any">Любой выбранный</button>
+        </div>
+        <span id="peopleSelectionCount">Никто не выбран</span>
+        <button type="button" id="peopleApply" disabled>Показать</button>
+      </div>
       <div id="peopleList" class="people-list"></div>
       <footer class="smart-footer" data-min-role="admin"><span>Лица анализируются локально, фотографии не отправляются наружу.</span><button id="facesReindex">Переиндексировать лица</button></footer>
     </section>
@@ -185,6 +193,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/static/vendor/leaflet/leaflet.js?v=1.9.4" defer></script>
-  <script src="/static/app.js?v=14" defer></script>
+  <script src="/static/app.js?v=15" defer></script>
 </body>
 </html>

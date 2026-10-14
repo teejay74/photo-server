@@ -1160,7 +1160,8 @@ class GalleryDatabase:
     def _filters(query: str, kind: str, year: int | None, month: int | None, favorite: bool,
                  album: int | None, filters: dict | None = None, day: int | None = None,
                  before_year: int | None = None, undated: bool = False, smart: str = "",
-                 person: int | None = None):
+                 person: int | None = None, people: list[int] | None = None,
+                 people_mode: str = "all"):
         clauses: list[str] = []
         values: list = []
         if query.strip():
@@ -1197,9 +1198,21 @@ class GalleryDatabase:
         if album is not None:
             clauses.append("EXISTS(SELECT 1 FROM album_photos ap WHERE ap.photo_id=p.id AND ap.album_id=?)")
             values.append(album)
-        if person is not None:
-            clauses.append("EXISTS(SELECT 1 FROM faces pf WHERE pf.photo_id=p.id AND pf.person_id=?)")
-            values.append(person)
+        selected_people = list(dict.fromkeys(people or ([person] if person is not None else [])))
+        if selected_people:
+            placeholders = ",".join("?" for _ in selected_people)
+            if people_mode == "any":
+                clauses.append(
+                    f"EXISTS(SELECT 1 FROM faces pf WHERE pf.photo_id=p.id AND pf.person_id IN ({placeholders}))"
+                )
+                values.extend(selected_people)
+            else:
+                clauses.append(
+                    f"(SELECT COUNT(DISTINCT pf.person_id) FROM faces pf "
+                    f"WHERE pf.photo_id=p.id AND pf.person_id IN ({placeholders}))=?"
+                )
+                values.extend(selected_people)
+                values.append(len(selected_people))
         filters = filters or {}
         if filters.get("camera"):
             clauses.append("p.camera_model=?")
@@ -1226,8 +1239,12 @@ class GalleryDatabase:
               month: int | None = None, favorite: bool = False, album: int | None = None,
               filters: dict | None = None, day: int | None = None,
               before_year: int | None = None, undated: bool = False,
-              smart: str = "", person: int | None = None) -> tuple[list[dict], int]:
-        where, values = self._filters(query, kind, year, month, favorite, album, filters, day, before_year, undated, smart, person)
+              smart: str = "", person: int | None = None, people: list[int] | None = None,
+              people_mode: str = "all") -> tuple[list[dict], int]:
+        where, values = self._filters(
+            query, kind, year, month, favorite, album, filters, day, before_year,
+            undated, smart, person, people, people_mode,
+        )
         select = """
             SELECT p.*,
                 EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
@@ -1771,7 +1788,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             day = int(params["day"][0]) if params.get("day") else None
             before_year = int(params["before_year"][0]) if params.get("before_year") else None
             album = int(params["album"][0]) if params.get("album") else None
-            person = int(params["person"][0]) if params.get("person") else None
+            people = list(dict.fromkeys(int(value) for value in params.get("person", [])))
             min_size = int(float(params["min_mb"][0]) * 1024 * 1024) if params.get("min_mb") else None
             max_size = int(float(params["max_mb"][0]) * 1024 * 1024) if params.get("max_mb") else None
         except ValueError:
@@ -1782,6 +1799,13 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         if day is not None and day not in range(1, 32):
             self.send_json({"error": "Некорректный день"}, HTTPStatus.BAD_REQUEST)
+            return
+        if len(people) > 20 or any(person_id <= 0 for person_id in people):
+            self.send_json({"error": "Можно выбрать от 1 до 20 корректных групп людей"}, HTTPStatus.BAD_REQUEST)
+            return
+        people_mode = params.get("people_mode", ["all"])[0]
+        if people_mode not in {"all", "any"}:
+            self.send_json({"error": "Некорректный режим поиска людей"}, HTTPStatus.BAD_REQUEST)
             return
         query = params.get("q", [""])[0][:100]
         kind = params.get("type", ["all"])[0]
@@ -1802,7 +1826,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
             "max_size": max_size,
         }
         items, total = self.app.database.query(
-            offset, limit, query, kind, year, month, favorite, album, filters, day, before_year, undated, smart, person
+            offset, limit, query, kind, year, month, favorite, album, filters, day,
+            before_year, undated, smart, people=people, people_mode=people_mode,
         )
         payload = [self.photo_payload(item) for item in items]
         self.send_json({"items": payload, "total": total, "offset": offset, "hasMore": offset + len(payload) < total})

@@ -121,6 +121,21 @@ class GalleryDatabaseTests(unittest.TestCase):
                 "INSERT INTO faces(photo_id,person_id,model_version,x,y,width,height,confidence,embedding,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (photos[1]["id"], second_person, 1, 6, 6, 21, 21, 0.94, embedding, now),
             ).lastrowid
+            shared_face = connection.execute(
+                "INSERT INTO faces(photo_id,person_id,model_version,x,y,width,height,confidence,embedding,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (photos[0]["id"], second_person, 1, 30, 5, 18, 18, 0.93, embedding, now),
+            ).lastrowid
+
+        together, total = self.database.query(
+            0, 10, "", "image", people=[first_person, second_person], people_mode="all"
+        )
+        self.assertEqual((len(together), total), (1, 1))
+        either, total = self.database.query(
+            0, 10, "", "image", people=[first_person, second_person], people_mode="any"
+        )
+        self.assertEqual((len(either), total), (2, 2))
+        with self.database.connect() as connection:
+            connection.execute("DELETE FROM faces WHERE id=?", (shared_face,))
 
         renamed = self.database.rename_person(first_person, "Артём")
         self.assertEqual(renamed["name"], "Артём")
@@ -234,6 +249,8 @@ class GalleryDatabaseTests(unittest.TestCase):
             status, data, _ = request("GET", "/api/photos?limit=10&type=image")
             self.assertEqual(status, 200)
             photo_id = data["items"][0]["id"]
+            status, data, _ = request("GET", "/api/photos?people_mode=invalid")
+            self.assertEqual((status, data["error"]), (400, "Некорректный режим поиска людей"))
             status, data, _ = request("GET", "/api/timeline")
             self.assertEqual((status, data["undated"]), (200, 0))
 

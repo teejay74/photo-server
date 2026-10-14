@@ -3,7 +3,8 @@ const state = {
   timeline: [], undatedCount: 0, albums: [], albumId: null, albumName: '', loading: false, hasMore: true,
   favoritesOnly: false, onThisDay: false, current: -1, controller: null, map: null, mapLayer: null,
   smartFilter: '', smartName: '', smartTimer: null,
-  people: [], personId: null, personName: '', activePerson: null,
+  people: [], personIds: [], personNames: [], personMode: 'all', activePerson: null,
+  peopleDraftIds: new Set(), peopleDraftMode: 'all',
   filters: {date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''},
   selecting: false, selected: new Set(), albumTargetIds: [], user: null, csrf: ''
 };
@@ -23,6 +24,14 @@ function toast(message){ const root=document.querySelector('#toast'); root.textC
 const roleLevel={viewer:1,editor:2,admin:3};
 const roleNames={viewer:'Просмотр',editor:'Редактор',admin:'Администратор'};
 function can(role){ return roleLevel[state.user?.role||'viewer']>=roleLevel[role]; }
+function resetPeopleFilter(){ state.personIds=[]; state.personNames=[]; state.personMode='all'; }
+function peopleFilterLabel(){
+  if(!state.personNames.length) return '';
+  if(state.personNames.length===1) return state.personNames[0];
+  const separator=state.personMode==='all'?' + ':' или ';
+  if(state.personNames.length<=3) return state.personNames.join(separator);
+  return `${state.personNames.slice(0,2).join(separator)} · ещё ${state.personNames.length-2}`;
+}
 function applyPermissions(){
   document.querySelectorAll('[data-min-role]').forEach(element=>element.hidden=!can(element.dataset.minRole));
   const button=document.querySelector('#accountButton'); button.textContent=(state.user?.username||'?').slice(0,1).toUpperCase(); button.title=state.user?.username||'Аккаунт';
@@ -51,7 +60,8 @@ async function load(reset=false){
   if(state.favoritesOnly) params.set('favorite','1');
   if(state.albumId) params.set('album',state.albumId);
   if(state.smartFilter) params.set('smart',state.smartFilter);
-  if(state.personId) params.set('person',state.personId);
+  for(const personId of state.personIds) params.append('person',personId);
+  if(state.personIds.length) params.set('people_mode',state.personMode);
   if(state.onThisDay){ const now=new Date(); params.set('month',now.getMonth()+1); params.set('day',now.getDate()); params.set('before_year',now.getFullYear()-1); }
   for(const [key,value] of Object.entries(state.filters)) if(value!=='') params.set(key,value);
   try{
@@ -98,8 +108,8 @@ function renderCollectionState(){
   favoriteButton.classList.toggle('active',state.favoritesOnly);
   const chip=document.querySelector('#collectionChip');
   const activeFilters=Object.values(state.filters).filter(Boolean).length;
-  chip.hidden=!state.favoritesOnly&&!state.albumId&&!state.onThisDay&&!state.smartFilter&&!state.personId&&!activeFilters;
-  document.querySelector('#collectionLabel').textContent=state.personId?state.personName:state.smartFilter?state.smartName:state.onThisDay?'В этот день':state.favoritesOnly?'Избранное':state.albumId?state.albumName:`Фильтры: ${activeFilters}`;
+  chip.hidden=!state.favoritesOnly&&!state.albumId&&!state.onThisDay&&!state.smartFilter&&!state.personIds.length&&!activeFilters;
+  document.querySelector('#collectionLabel').textContent=state.personIds.length?peopleFilterLabel():state.smartFilter?state.smartName:state.onThisDay?'В этот день':state.favoritesOnly?'Избранное':state.albumId?state.albumName:`Фильтры: ${activeFilters}`;
   document.querySelector('#todayButton').classList.toggle('active',state.onThisDay);
   document.querySelector('#smartButton').classList.toggle('active',Boolean(state.smartFilter));
   document.querySelector('#filtersButton').classList.toggle('active',Boolean(activeFilters));
@@ -135,7 +145,7 @@ function showMonths(entry,anchor){
   picker.hidden=false; const rect=anchor.getBoundingClientRect(); picker.style.top=`${Math.min(innerHeight-picker.offsetHeight-12,Math.max(74,rect.top-30))}px`;
 }
 function clearPeriod(){ state.year=null; state.month=null; state.undated=false; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; renderTimeline(); renderCollectionState(); load(true); }
-function clearCollection(){ state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; state.personId=null; state.personName=''; state.filters={date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''}; renderCollectionState(); load(true); }
+function clearCollection(){ state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; resetPeopleFilter(); state.filters={date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''}; renderCollectionState(); load(true); }
 
 function toggleSelection(id){
   if(state.selected.has(id)) state.selected.delete(id); else state.selected.add(id);
@@ -242,7 +252,7 @@ function renderAlbums(){
 }
 
 function selectAlbum(album){
-  state.albumId=album.id; state.albumName=album.name; state.favoritesOnly=false; state.onThisDay=false; state.smartFilter=''; state.smartName=''; state.personId=null; state.personName='';
+  state.albumId=album.id; state.albumName=album.name; state.favoritesOnly=false; state.onThisDay=false; state.smartFilter=''; state.smartName=''; resetPeopleFilter();
   document.querySelector('#albumsDialog').close(); renderCollectionState(); load(true);
 }
 
@@ -277,31 +287,47 @@ function renderSmartCatalog(data){
 
 function selectSmartCollection(collection){
   state.smartFilter=collection.key; state.smartName=collection.name; state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false;
-  state.personId=null; state.personName=''; state.year=null; state.month=null; state.undated=false; document.querySelector('#smartDialog').close(); renderTimeline(); renderCollectionState(); load(true);
+  resetPeopleFilter(); state.year=null; state.month=null; state.undated=false; document.querySelector('#smartDialog').close(); renderTimeline(); renderCollectionState(); load(true);
 }
 
 async function openPeople(){
   if(document.querySelector('#smartDialog').open) document.querySelector('#smartDialog').close();
   const dialog=document.querySelector('#peopleDialog'); if(!dialog.open) dialog.showModal();
+  state.peopleDraftIds=new Set(state.personIds); state.peopleDraftMode=state.personMode; renderPeopleSelection();
   const root=document.querySelector('#peopleList'); root.innerHTML='<div class="album-empty">Загружаем людей…</div>';
   try{
     const data=await api('/api/people'); state.people=data.people; const progress=data.progress;
     document.querySelector('#peopleProgress').textContent=progress.ready>=progress.total
       ? `${progress.faces.toLocaleString('ru-RU')} лиц · ${progress.people.toLocaleString('ru-RU')} групп`
       : `Обработано ${progress.ready.toLocaleString('ru-RU')} из ${progress.total.toLocaleString('ru-RU')} фотографий · найдено лиц: ${progress.faces.toLocaleString('ru-RU')}`;
-    root.innerHTML='';
+    const availableIds=new Set(state.people.map(person=>person.id)); state.peopleDraftIds=new Set([...state.peopleDraftIds].filter(id=>availableIds.has(id))); root.innerHTML='';
     if(!state.people.length){ root.innerHTML='<div class="album-empty">Лица пока не найдены. Фоновая обработка продолжается.</div>'; return; }
     for(const person of state.people){
-      const card=document.createElement('article'); card.className='person-card';
-      card.innerHTML=`<button><img loading="lazy" src="${person.coverUrl}" alt=""><span class="person-card-info"><strong>${escapeHtml(person.name)}</strong><small>${person.photoCount.toLocaleString('ru-RU')} фото · ${person.faceCount.toLocaleString('ru-RU')} лиц</small></span></button>${can('editor')?'<button class="person-review" title="Проверить группу">⋯</button>':''}`;
-      card.querySelector('button:first-child').addEventListener('click',()=>selectPerson(person));
+      const selected=state.peopleDraftIds.has(person.id); const card=document.createElement('article'); card.className='person-card'+(selected?' selected':'');
+      card.innerHTML=`<button aria-pressed="${selected}"><img loading="lazy" src="${person.coverUrl}" alt=""><span class="person-check">✓</span><span class="person-group-id">#${person.id}</span><span class="person-card-info"><strong>${escapeHtml(person.name)}</strong><small>${person.photoCount.toLocaleString('ru-RU')} фото · ${person.faceCount.toLocaleString('ru-RU')} лиц</small></span></button>${can('editor')?'<button class="person-review" title="Проверить группу">⋯</button>':''}`;
+      card.querySelector('button:first-child').addEventListener('click',()=>togglePersonSelection(person,card));
       card.querySelector('.person-review')?.addEventListener('click',()=>openPersonFaces(person)); root.append(card);
     }
+    renderPeopleSelection();
   }catch(error){ root.innerHTML=`<div class="album-empty">${escapeHtml(error.message)}</div>`; }
 }
 
-function selectPerson(person){
-  state.personId=person.id; state.personName=person.name; state.smartFilter=''; state.smartName=''; state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false;
+function togglePersonSelection(person,card){
+  if(state.peopleDraftIds.has(person.id)) state.peopleDraftIds.delete(person.id);
+  else if(state.peopleDraftIds.size>=20){ toast('Можно выбрать не более 20 человек'); return; }
+  else state.peopleDraftIds.add(person.id);
+  const selected=state.peopleDraftIds.has(person.id); card.classList.toggle('selected',selected); card.querySelector('button:first-child').setAttribute('aria-pressed',selected); renderPeopleSelection();
+}
+
+function renderPeopleSelection(){
+  document.querySelectorAll('[data-people-mode]').forEach(button=>button.classList.toggle('active',button.dataset.peopleMode===state.peopleDraftMode));
+  const count=state.peopleDraftIds.size; document.querySelector('#peopleSelectionCount').textContent=count?`Выбрано: ${count}`:'Никто не выбран'; document.querySelector('#peopleApply').disabled=!count;
+}
+
+function applyPeopleFilter(){
+  const selected=state.people.filter(person=>state.peopleDraftIds.has(person.id)); if(!selected.length) return;
+  state.personIds=selected.map(person=>person.id); state.personNames=selected.map(person=>person.name); state.personMode=state.peopleDraftMode;
+  state.smartFilter=''; state.smartName=''; state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false;
   state.year=null; state.month=null; state.undated=false; document.querySelector('#peopleDialog').close(); renderTimeline(); renderCollectionState(); load(true);
 }
 
@@ -492,16 +518,18 @@ document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>
 }));
 document.querySelector('#searchButton').addEventListener('click',()=>{ document.querySelector('#searchWrap').classList.add('open'); document.querySelector('#searchInput').focus(); });
 document.querySelector('#searchInput').addEventListener('input',debounce(event=>{ state.query=event.target.value; load(true); }));
-document.querySelector('#favoritesButton').addEventListener('click',()=>{ state.favoritesOnly=!state.favoritesOnly; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; state.personId=null; state.personName=''; renderCollectionState(); load(true); });
+document.querySelector('#favoritesButton').addEventListener('click',()=>{ state.favoritesOnly=!state.favoritesOnly; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; resetPeopleFilter(); renderCollectionState(); load(true); });
 document.querySelector('#smartButton').addEventListener('click',openSmartCatalog);
 document.querySelector('#smartReindex').addEventListener('click',reindexSmartCatalog);
 document.querySelector('#facesReindex').addEventListener('click',reindexFaces);
 document.querySelector('#renamePerson').addEventListener('click',renameActivePerson);
 document.querySelector('#mergePerson').addEventListener('click',mergeActivePerson);
+document.querySelectorAll('[data-people-mode]').forEach(button=>button.addEventListener('click',()=>{ state.peopleDraftMode=button.dataset.peopleMode; renderPeopleSelection(); }));
+document.querySelector('#peopleApply').addEventListener('click',applyPeopleFilter);
 document.querySelector('#albumsButton').addEventListener('click',async()=>{ try{ await fetchAlbums(); document.querySelector('#albumsDialog').showModal(); }catch(error){toast(error.message);} });
 document.querySelector('#mapButton').addEventListener('click',openMap);
 document.querySelector('#accountButton').addEventListener('click',openAccount);
-document.querySelector('#todayButton').addEventListener('click',()=>{ state.onThisDay=!state.onThisDay; state.year=null; state.month=null; state.undated=false; state.albumId=null; state.albumName=''; state.favoritesOnly=false; state.smartFilter=''; state.smartName=''; state.personId=null; state.personName=''; renderTimeline(); renderCollectionState(); load(true); });
+document.querySelector('#todayButton').addEventListener('click',()=>{ state.onThisDay=!state.onThisDay; state.year=null; state.month=null; state.undated=false; state.albumId=null; state.albumName=''; state.favoritesOnly=false; state.smartFilter=''; state.smartName=''; resetPeopleFilter(); renderTimeline(); renderCollectionState(); load(true); });
 document.querySelector('#duplicatesButton').addEventListener('click',()=>openDuplicates('exact'));
 document.querySelectorAll('[data-duplicate-mode]').forEach(button=>button.addEventListener('click',()=>openDuplicates(button.dataset.duplicateMode)));
 document.querySelector('#filtersButton').addEventListener('click',openFilters);
