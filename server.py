@@ -1203,13 +1203,13 @@ class GalleryDatabase:
             placeholders = ",".join("?" for _ in selected_people)
             if people_mode == "any":
                 clauses.append(
-                    f"EXISTS(SELECT 1 FROM faces pf WHERE pf.photo_id=p.id AND pf.person_id IN ({placeholders}))"
+                    f"p.id IN (SELECT pf.photo_id FROM faces pf WHERE pf.person_id IN ({placeholders}))"
                 )
                 values.extend(selected_people)
             else:
                 clauses.append(
-                    f"(SELECT COUNT(DISTINCT pf.person_id) FROM faces pf "
-                    f"WHERE pf.photo_id=p.id AND pf.person_id IN ({placeholders}))=?"
+                    f"p.id IN (SELECT pf.photo_id FROM faces pf WHERE pf.person_id IN ({placeholders}) "
+                    f"GROUP BY pf.photo_id HAVING COUNT(DISTINCT pf.person_id)=?)"
                 )
                 values.extend(selected_people)
                 values.append(len(selected_people))
