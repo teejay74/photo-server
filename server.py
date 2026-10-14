@@ -28,6 +28,15 @@ try:
 except ImportError:  # The gallery still works, but EXIF and thumbnails are unavailable.
     Image = ImageOps = None
 
+try:
+    from smart_catalog import SMART_MODEL_VERSION, analyze_image, tesseract_available
+except ImportError:  # Smart analysis is optional outside the Docker image.
+    SMART_MODEL_VERSION = 0
+    analyze_image = None
+
+    def tesseract_available():
+        return False
+
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
@@ -255,6 +264,32 @@ class GalleryDatabase:
                     value TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS smart_analysis (
+                    photo_id TEXT PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+                    model_version INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    tags TEXT NOT NULL,
+                    ocr_text TEXT NOT NULL DEFAULT '',
+                    search_text TEXT NOT NULL DEFAULT '',
+                    dominant_color TEXT,
+                    brightness REAL,
+                    contrast REAL,
+                    sharpness REAL,
+                    analyzed_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS smart_analysis_category_idx ON smart_analysis(category);
+                CREATE INDEX IF NOT EXISTS smart_analysis_version_idx ON smart_analysis(model_version);
+
+                CREATE TABLE IF NOT EXISTS smart_jobs (
+                    photo_id TEXT PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+                    model_version INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','running','done','failed')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS smart_jobs_status_idx ON smart_jobs(status, updated_at);
+
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -293,6 +328,26 @@ class GalleryDatabase:
                 connection.execute("ALTER TABLE photos ADD COLUMN perceptual_hash TEXT")
             connection.execute("CREATE INDEX IF NOT EXISTS photos_content_hash_idx ON photos(content_hash)")
             connection.execute("CREATE INDEX IF NOT EXISTS photos_perceptual_hash_idx ON photos(perceptual_hash)")
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            # A process interruption must not leave a photo permanently claimed.
+            connection.execute(
+                "UPDATE smart_jobs SET status='pending',updated_at=? WHERE status='running'", (now,)
+            )
+            if SMART_MODEL_VERSION:
+                connection.execute(
+                    """
+                    INSERT INTO smart_jobs(photo_id,model_version,status,attempts,updated_at)
+                    SELECT p.id,?,'pending',0,? FROM photos p
+                    LEFT JOIN smart_analysis s ON s.photo_id=p.id AND s.model_version=?
+                    WHERE p.type='image' AND s.photo_id IS NULL
+                    ON CONFLICT(photo_id) DO UPDATE SET
+                        model_version=excluded.model_version,
+                        status=CASE WHEN smart_jobs.model_version!=excluded.model_version THEN 'pending' ELSE smart_jobs.status END,
+                        attempts=CASE WHEN smart_jobs.model_version!=excluded.model_version THEN 0 ELSE smart_jobs.attempts END,
+                        updated_at=CASE WHEN smart_jobs.model_version!=excluded.model_version THEN excluded.updated_at ELSE smart_jobs.updated_at END
+                    """,
+                    (SMART_MODEL_VERSION, now, SMART_MODEL_VERSION),
+                )
 
     @staticmethod
     def _public_user(row: sqlite3.Row) -> dict:
@@ -557,6 +612,21 @@ class GalleryDatabase:
                         """,
                         changed,
                     )
+                    smart_changed = [item for item in changed if item["type"] == "image"]
+                    if smart_changed and SMART_MODEL_VERSION:
+                        connection.executemany(
+                            "DELETE FROM smart_analysis WHERE photo_id=?",
+                            ((item["id"],) for item in smart_changed),
+                        )
+                        connection.executemany(
+                            """
+                            INSERT INTO smart_jobs(photo_id,model_version,status,attempts,error,updated_at)
+                            VALUES(?,?,'pending',0,NULL,?)
+                            ON CONFLICT(photo_id) DO UPDATE SET
+                                model_version=excluded.model_version,status='pending',attempts=0,error=NULL,updated_at=excluded.updated_at
+                            """,
+                            ((item["id"], SMART_MODEL_VERSION, now) for item in smart_changed),
+                        )
                 if removed:
                     connection.executemany("DELETE FROM photos WHERE path=?", ((path,) for path in removed))
                 connection.execute(
@@ -633,16 +703,174 @@ class GalleryDatabase:
         finally:
             self.hash_lock.release()
 
+    def analyze_next(self, *, ocr_enabled: bool = True, ocr_languages: str = "rus+eng",
+                     ocr_timeout: int = 20) -> dict:
+        """Claim and analyze one image so the worker never monopolizes the server."""
+        if not SMART_MODEL_VERSION or analyze_image is None or Image is None:
+            return {"status": "unavailable"}
+        if not self.storage_available():
+            return {"status": "storage_unavailable"}
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT j.photo_id,p.path,p.name FROM smart_jobs j
+                JOIN photos p ON p.id=j.photo_id
+                WHERE j.status='pending' AND j.model_version=? AND j.attempts<3
+                ORDER BY j.updated_at,j.photo_id LIMIT 1
+                """,
+                (SMART_MODEL_VERSION,),
+            ).fetchone()
+            if not row:
+                return {"status": "idle"}
+            connection.execute(
+                "UPDATE smart_jobs SET status='running',attempts=attempts+1,error=NULL,updated_at=? WHERE photo_id=?",
+                (now, row["photo_id"]),
+            )
+        target = safe_join(self.root, row["path"])
+        try:
+            if not target or not target.is_file():
+                raise FileNotFoundError(row["path"])
+            result = analyze_image(
+                target, row["name"], ocr_enabled=ocr_enabled,
+                ocr_languages=ocr_languages, ocr_timeout=ocr_timeout,
+            )
+            completed = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            with self.connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO smart_analysis(
+                        photo_id,model_version,category,tags,ocr_text,search_text,
+                        dominant_color,brightness,contrast,sharpness,analyzed_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(photo_id) DO UPDATE SET
+                        model_version=excluded.model_version,category=excluded.category,tags=excluded.tags,
+                        ocr_text=excluded.ocr_text,search_text=excluded.search_text,
+                        dominant_color=excluded.dominant_color,brightness=excluded.brightness,
+                        contrast=excluded.contrast,sharpness=excluded.sharpness,analyzed_at=excluded.analyzed_at
+                    """,
+                    (
+                        row["photo_id"], SMART_MODEL_VERSION, result["category"],
+                        json.dumps(result["tags"], ensure_ascii=False, separators=(",", ":")),
+                        result["ocr_text"], result["search_text"], result["dominant_color"],
+                        result["brightness"], result["contrast"], result["sharpness"], completed,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE smart_jobs SET status='done',error=NULL,updated_at=? WHERE photo_id=?",
+                    (completed, row["photo_id"]),
+                )
+            return {"status": "complete", "photoId": row["photo_id"], "category": result["category"]}
+        except Exception as error:
+            failed = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            with self.connect() as connection:
+                connection.execute(
+                    "UPDATE smart_jobs SET status='failed',error=?,updated_at=? WHERE photo_id=?",
+                    (str(error)[:500], failed, row["photo_id"]),
+                )
+            print(f"Smart analysis failed for {row['path']}: {error}", file=sys.stderr, flush=True)
+            return {"status": "failed", "photoId": row["photo_id"]}
+
+    def smart_progress(self) -> dict:
+        with self.connect() as connection:
+            total = connection.execute("SELECT COUNT(*) FROM photos WHERE type='image'").fetchone()[0]
+            ready = connection.execute(
+                "SELECT COUNT(*) FROM smart_analysis WHERE model_version=?", (SMART_MODEL_VERSION,)
+            ).fetchone()[0]
+            rows = connection.execute(
+                "SELECT status,COUNT(*) count FROM smart_jobs WHERE model_version=? GROUP BY status",
+                (SMART_MODEL_VERSION,),
+            ).fetchall()
+        statuses = {row["status"]: row["count"] for row in rows}
+        return {
+            "total": total, "ready": ready, "pending": statuses.get("pending", 0),
+            "running": statuses.get("running", 0), "failed": statuses.get("failed", 0),
+            "modelVersion": SMART_MODEL_VERSION, "ocrAvailable": tesseract_available(),
+        }
+
+    @staticmethod
+    def _smart_filter_clause(key: str) -> str | None:
+        clauses = {
+            "screenshots": "EXISTS(SELECT 1 FROM smart_analysis sa WHERE sa.photo_id=p.id AND sa.category='screenshot')",
+            "documents": "EXISTS(SELECT 1 FROM smart_analysis sa WHERE sa.photo_id=p.id AND sa.category='document')",
+            "panoramas": "EXISTS(SELECT 1 FROM smart_analysis sa WHERE sa.photo_id=p.id AND sa.category='panorama')",
+            "text": "EXISTS(SELECT 1 FROM smart_analysis sa WHERE sa.photo_id=p.id AND sa.ocr_text!='')",
+            "dark": "EXISTS(SELECT 1 FROM smart_analysis sa WHERE sa.photo_id=p.id AND sa.tags LIKE '%\"dark\"%')",
+            "bright": "EXISTS(SELECT 1 FROM smart_analysis sa WHERE sa.photo_id=p.id AND sa.tags LIKE '%\"bright\"%')",
+            "monochrome": "EXISTS(SELECT 1 FROM smart_analysis sa WHERE sa.photo_id=p.id AND sa.tags LIKE '%\"monochrome\"%')",
+            "colorful": "EXISTS(SELECT 1 FROM smart_analysis sa WHERE sa.photo_id=p.id AND sa.tags LIKE '%\"colorful\"%')",
+            "undated": "p.date_source='modified'",
+            "located": "p.latitude IS NOT NULL AND p.longitude IS NOT NULL",
+        }
+        return clauses.get(key)
+
+    def smart_catalog(self) -> dict:
+        definitions = [
+            ("screenshots", "Скриншоты", "Снимки экрана", "▤"),
+            ("documents", "Документы", "Сканы и фотографии с текстом", "▧"),
+            ("text", "Найден текст", "Поиск по распознанным надписям", "Aa"),
+            ("panoramas", "Панорамы", "Широкие кадры", "↔"),
+            ("located", "С геопозицией", "Фотографии на карте", "⌖"),
+            ("undated", "Без даты", "Нуждаются в уточнении", "?"),
+            ("dark", "Тёмные кадры", "Ночные и слабо освещённые", "◐"),
+            ("bright", "Светлые кадры", "Яркие фотографии", "☼"),
+            ("monochrome", "Монохром", "Чёрно-белые и серые", "◒"),
+            ("colorful", "Насыщенные", "Яркие цвета", "◉"),
+        ]
+        collections = []
+        with self.connect() as connection:
+            for key, name, description, icon in definitions:
+                clause = self._smart_filter_clause(key)
+                row = connection.execute(
+                    f"SELECT COUNT(*) count FROM photos p WHERE {clause}"
+                ).fetchone()
+                cover_row = connection.execute(
+                    f"SELECT p.path FROM photos p WHERE {clause} ORDER BY p.taken DESC LIMIT 1"
+                ).fetchone()
+                collections.append({
+                    "key": key, "name": name, "description": description, "icon": icon,
+                    "count": row["count"], "cover": cover_row["path"] if cover_row else None,
+                })
+        return {"collections": collections, "progress": self.smart_progress()}
+
+    def queue_smart_reindex(self, failed_only: bool = False) -> int:
+        if not SMART_MODEL_VERSION:
+            return 0
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            if failed_only:
+                cursor = connection.execute(
+                    "UPDATE smart_jobs SET status='pending',attempts=0,error=NULL,updated_at=? WHERE status='failed'",
+                    (now,),
+                )
+                return cursor.rowcount
+            connection.execute("DELETE FROM smart_analysis")
+            connection.execute("DELETE FROM smart_jobs")
+            cursor = connection.execute(
+                """
+                INSERT INTO smart_jobs(photo_id,model_version,status,attempts,updated_at)
+                SELECT id,?,'pending',0,? FROM photos WHERE type='image'
+                """,
+                (SMART_MODEL_VERSION, now),
+            )
+            return cursor.rowcount
+
     @staticmethod
     def _filters(query: str, kind: str, year: int | None, month: int | None, favorite: bool,
                  album: int | None, filters: dict | None = None, day: int | None = None,
-                 before_year: int | None = None, undated: bool = False):
+                 before_year: int | None = None, undated: bool = False, smart: str = ""):
         clauses: list[str] = []
         values: list = []
         if query.strip():
             needle = f"%{query.strip()}%"
-            clauses.append("(p.name LIKE ? COLLATE NOCASE OR p.taken LIKE ? OR p.camera_make LIKE ? COLLATE NOCASE OR p.camera_model LIKE ? COLLATE NOCASE)")
-            values.extend([needle, needle, needle, needle])
+            smart_needle = f"%{query.strip().casefold()}%"
+            clauses.append(
+                "(p.name LIKE ? COLLATE NOCASE OR p.taken LIKE ? OR p.camera_make LIKE ? COLLATE NOCASE "
+                "OR p.camera_model LIKE ? COLLATE NOCASE OR EXISTS(SELECT 1 FROM smart_analysis sa "
+                "WHERE sa.photo_id=p.id AND (sa.ocr_text LIKE ? COLLATE NOCASE OR sa.search_text LIKE ? COLLATE NOCASE)))"
+            )
+            values.extend([needle, needle, needle, needle, smart_needle, smart_needle])
         if kind != "all":
             clauses.append("p.type=?")
             values.append(kind)
@@ -660,6 +888,9 @@ class GalleryDatabase:
             values.append(before_year)
         if undated:
             clauses.append("p.date_source='modified'")
+        smart_clause = GalleryDatabase._smart_filter_clause(smart)
+        if smart_clause:
+            clauses.append(smart_clause)
         if favorite:
             clauses.append("EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id)")
         if album is not None:
@@ -690,12 +921,15 @@ class GalleryDatabase:
     def query(self, offset: int, limit: int, query: str, kind: str, year: int | None = None,
               month: int | None = None, favorite: bool = False, album: int | None = None,
               filters: dict | None = None, day: int | None = None,
-              before_year: int | None = None, undated: bool = False) -> tuple[list[dict], int]:
-        where, values = self._filters(query, kind, year, month, favorite, album, filters, day, before_year, undated)
+              before_year: int | None = None, undated: bool = False,
+              smart: str = "") -> tuple[list[dict], int]:
+        where, values = self._filters(query, kind, year, month, favorite, album, filters, day, before_year, undated, smart)
         select = """
             SELECT p.*,
                 EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
-                (SELECT GROUP_CONCAT(ap.album_id) FROM album_photos ap WHERE ap.photo_id=p.id) AS album_ids
+                (SELECT GROUP_CONCAT(ap.album_id) FROM album_photos ap WHERE ap.photo_id=p.id) AS album_ids,
+                (SELECT category FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_category,
+                (SELECT tags FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_tags
             FROM photos p
         """
         with self.connect() as connection:
@@ -717,6 +951,12 @@ class GalleryDatabase:
         item["cameraMake"] = item.pop("camera_make")
         item["cameraModel"] = item.pop("camera_model")
         item["dateSource"] = item.pop("date_source")
+        item["smartCategory"] = item.pop("smart_category", None)
+        smart_tags = item.pop("smart_tags", None)
+        try:
+            item["smartTags"] = json.loads(smart_tags) if smart_tags else []
+        except json.JSONDecodeError:
+            item["smartTags"] = []
         item.pop("mtime_ns", None)
         item.pop("indexed_at", None)
         item.pop("content_hash", None)
@@ -882,7 +1122,9 @@ class GalleryDatabase:
         select = """
             SELECT p.*,
                 EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
-                (SELECT GROUP_CONCAT(ap.album_id) FROM album_photos ap WHERE ap.photo_id=p.id) AS album_ids
+                (SELECT GROUP_CONCAT(ap.album_id) FROM album_photos ap WHERE ap.photo_id=p.id) AS album_ids,
+                (SELECT category FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_category,
+                (SELECT tags FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_tags
             FROM photos p
         """
         with self.connect() as connection:
@@ -1199,6 +1441,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         kind = kind if kind in {"all", "image", "video"} else "all"
         favorite = params.get("favorite", ["0"])[0] == "1"
         undated = params.get("undated", ["0"])[0] == "1"
+        smart = params.get("smart", [""])[0][:30]
+        if smart and not self.app.database._smart_filter_clause(smart):
+            self.send_json({"error": "Неизвестная умная коллекция"}, HTTPStatus.BAD_REQUEST)
+            return
         gps = params.get("gps", [""])[0]
         filters = {
             "camera": params.get("camera", [""])[0][:120],
@@ -1209,7 +1455,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             "max_size": max_size,
         }
         items, total = self.app.database.query(
-            offset, limit, query, kind, year, month, favorite, album, filters, day, before_year, undated
+            offset, limit, query, kind, year, month, favorite, album, filters, day, before_year, undated, smart
         )
         payload = [self.photo_payload(item) for item in items]
         self.send_json({"items": payload, "total": total, "offset": offset, "hasMore": offset + len(payload) < total})
@@ -1260,6 +1506,13 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/filters":
             self.send_json(self.app.database.filter_options())
+            return
+        if path == "/api/smart/catalog":
+            catalog = self.app.database.smart_catalog()
+            for collection in catalog["collections"]:
+                cover = collection.pop("cover")
+                collection["coverUrl"] = "/thumb/" + quote(cover, safe="/") if cover else None
+            self.send_json(catalog)
             return
         if path == "/api/duplicates":
             mode = params.get("mode", ["exact"])[0]
@@ -1426,6 +1679,12 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 backup = self.app.database.create_backup(self.app.backup_retention)
                 self.send_json(backup, HTTPStatus.CREATED)
                 return
+            if path == "/api/smart/reindex":
+                if not self.require_auth("admin"):
+                    return
+                count = self.app.database.queue_smart_reindex(bool(body.get("failedOnly", False)))
+                self.send_json({"queued": count})
+                return
             if path == "/api/download/zip":
                 photo_ids = body.get("photoIds", [])
                 if not isinstance(photo_ids, list) or not photo_ids or len(photo_ids) > 500:
@@ -1493,6 +1752,10 @@ def main():
         parser.error(f"Каталог не найден: {photo_root}")
     backup_retention = max(1, int(os.getenv("PHOTO_BACKUP_RETENTION", "7")))
     backup_interval = max(1, int(os.getenv("PHOTO_BACKUP_INTERVAL", "24")))
+    smart_ocr = os.getenv("PHOTO_SMART_OCR", "true").lower() in {"1", "true", "yes"}
+    smart_delay = max(0.2, float(os.getenv("PHOTO_SMART_DELAY", "1.5")))
+    smart_languages = os.getenv("PHOTO_SMART_OCR_LANGUAGES", "rus+eng")[:40]
+    smart_timeout = max(5, min(120, int(os.getenv("PHOTO_SMART_OCR_TIMEOUT", "20"))))
     marker_file = os.getenv("PHOTO_MARKER_FILE", ".photodom-storage")
     database = GalleryDatabase(photo_root, Path(args.database), Path(args.backups), marker_file)
     database.bootstrap_admin(os.getenv("PHOTO_USER", "photos"), os.getenv("PHOTO_PASSWORD", ""))
@@ -1540,9 +1803,23 @@ def main():
                 print(f"SQLite backup failed: {error}", file=sys.stderr, flush=True)
             time.sleep(3600)
 
+    def analyze_smart_catalog():
+        while True:
+            try:
+                result = database.analyze_next(
+                    ocr_enabled=smart_ocr,
+                    ocr_languages=smart_languages,
+                    ocr_timeout=smart_timeout,
+                )
+                time.sleep(10 if result["status"] in {"idle", "unavailable", "storage_unavailable"} else smart_delay)
+            except Exception as error:
+                print(f"Smart catalog worker failed: {error}", file=sys.stderr, flush=True)
+                time.sleep(30)
+
     threading.Thread(target=refresh_periodically, name="photo-index-refresh", daemon=True).start()
     threading.Thread(target=enrich_hashes_periodically, name="photo-hash-enrichment", daemon=True).start()
     threading.Thread(target=backup_periodically, name="photo-db-backup", daemon=True).start()
+    threading.Thread(target=analyze_smart_catalog, name="photo-smart-catalog", daemon=True).start()
     print(f"Photo gallery: http://{args.host}:{args.port} ({database.stats()['total']} files)", flush=True)
     try:
         server.serve_forever()

@@ -16,11 +16,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --requirement requirements.txt \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir --requirement requirements.txt \
     && groupadd --gid "${APP_GID}" gallery \
     && useradd --uid "${APP_UID}" --gid gallery --no-create-home --shell /usr/sbin/nologin gallery
 
 COPY --chown=gallery:gallery server.py ./server.py
+COPY --chown=gallery:gallery smart_catalog.py ./smart_catalog.py
 COPY --chown=gallery:gallery static ./static
 
 RUN mkdir -p /app/.cache /app/data /app/backups && chown gallery:gallery /app/.cache /app/data /app/backups

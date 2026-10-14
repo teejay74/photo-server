@@ -77,6 +77,28 @@ class GalleryDatabaseTests(unittest.TestCase):
         self.assertTrue((self.database.backup_dir / backup["name"]).is_file())
         self.assertEqual(len(self.database.backup_status()["backups"]), 1)
 
+    def test_smart_catalog_incremental_analysis_and_search(self):
+        progress = self.database.smart_progress()
+        self.assertEqual((progress["total"], progress["ready"], progress["pending"]), (1, 0, 1))
+        result = self.database.analyze_next(ocr_enabled=False)
+        self.assertEqual(result["status"], "complete")
+        progress = self.database.smart_progress()
+        self.assertEqual((progress["ready"], progress["pending"]), (1, 0))
+
+        matches, total = self.database.query(0, 10, "зеленое", "image")
+        self.assertEqual(total, 1)
+        self.assertIn("color:green", matches[0]["smartTags"])
+        catalog = self.database.smart_catalog()
+        self.assertEqual(catalog["progress"]["ready"], 1)
+
+        Image.new("RGB", (240, 80), "#111111").save(self.root / "wide.jpg")
+        self.database.refresh()
+        self.assertEqual(self.database.smart_progress()["pending"], 1)
+        self.database.analyze_next(ocr_enabled=False)
+        panoramas, count = self.database.query(0, 10, "", "image", smart="panoramas")
+        self.assertEqual(count, 1)
+        self.assertEqual(panoramas[0]["smartCategory"], "panorama")
+
     def test_gps_conversion(self):
         self.assertEqual(gps_coordinate((55, 45, 0), "N"), 55.75)
         self.assertEqual(gps_coordinate((37, 37, 0), "W"), -37.6166667)
@@ -198,6 +220,11 @@ class GalleryDatabaseTests(unittest.TestCase):
             self.assertEqual((status, data["count"]), (200, 1))
             status, data, _ = request("GET", "/api/filters")
             self.assertEqual((status, data["cameras"][0]["value"]), (200, "Test Camera"))
+            status, data, _ = request("GET", "/api/smart/catalog")
+            self.assertEqual(status, 200)
+            self.assertIn("progress", data)
+            status, data, _ = request("POST", "/api/smart/reindex", {})
+            self.assertEqual((status, data["queued"]), (200, 1))
             status, data, _ = request("GET", "/api/duplicates?mode=exact")
             self.assertEqual((status, data["groups"]), (200, []))
             status, data, _ = request("POST", "/api/backups", {})

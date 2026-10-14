@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d0e10">
   <title>ФотоДом</title>
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css?v=1.9.4">
-  <link rel="stylesheet" href="/static/styles.css?v=13">
+  <link rel="stylesheet" href="/static/styles.css?v=14">
 </head>
 <body>
   <header class="topbar">
@@ -14,6 +14,7 @@
       <span class="brand-mark">◉</span><span>Мои фотографии</span>
     </a>
     <div class="header-actions">
+      <button class="icon-button" id="smartButton" title="Умный каталог" aria-label="Открыть умный каталог">✦</button>
       <button class="icon-button" id="todayButton" title="В этот день" aria-label="Фотографии в этот день">◷</button>
       <button class="icon-button" id="albumsButton" title="Альбомы" aria-label="Открыть альбомы">▣</button>
       <button class="icon-button" id="mapButton" title="Карта" aria-label="Открыть карту">⌖</button>
@@ -36,7 +37,7 @@
     <section class="controls" aria-label="Фильтры">
       <div class="search-wrap" id="searchWrap">
         <span>⌕</span>
-        <input id="searchInput" type="search" placeholder="Название или дата…" autocomplete="off">
+        <input id="searchInput" type="search" placeholder="Название, текст или содержание…" autocomplete="off">
         <kbd>Esc</kbd>
       </div>
       <div class="filter-row">
@@ -86,6 +87,15 @@
         <button type="submit">Создать</button>
       </form>
       <div id="albumList" class="album-list"></div>
+    </section>
+  </dialog>
+
+  <dialog id="smartDialog" class="panel-dialog smart-dialog">
+    <section class="panel-shell">
+      <header class="panel-header"><div><small>ЛОКАЛЬНЫЙ АНАЛИЗ</small><h2>Умный каталог</h2><p>Автоматические коллекции и поиск по тексту на фотографиях</p></div><button data-close="smartDialog" aria-label="Закрыть">×</button></header>
+      <div id="smartProgress" class="smart-progress">Проверяем индекс…</div>
+      <div id="smartCollections" class="smart-collections"></div>
+      <footer class="smart-footer" data-min-role="admin"><span>Анализ выполняется в фоне по одному файлу.</span><button id="smartReindex">Переиндексировать</button></footer>
     </section>
   </dialog>
 
@@ -159,6 +169,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/static/vendor/leaflet/leaflet.js?v=1.9.4" defer></script>
-  <script src="/static/app.js?v=11" defer></script>
+  <script src="/static/app.js?v=12" defer></script>
 </body>
 </html>

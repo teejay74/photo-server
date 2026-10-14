@@ -2,6 +2,7 @@ const state = {
   items: [], total: 0, offset: 0, type: 'all', query: '', year: null, month: null, undated: false,
   timeline: [], undatedCount: 0, albums: [], albumId: null, albumName: '', loading: false, hasMore: true,
   favoritesOnly: false, onThisDay: false, current: -1, controller: null, map: null, mapLayer: null,
+  smartFilter: '', smartName: '', smartTimer: null,
   filters: {date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''},
   selecting: false, selected: new Set(), albumTargetIds: [], user: null, csrf: ''
 };
@@ -48,6 +49,7 @@ async function load(reset=false){
   if(state.undated) params.set('undated','1');
   if(state.favoritesOnly) params.set('favorite','1');
   if(state.albumId) params.set('album',state.albumId);
+  if(state.smartFilter) params.set('smart',state.smartFilter);
   if(state.onThisDay){ const now=new Date(); params.set('month',now.getMonth()+1); params.set('day',now.getDate()); params.set('before_year',now.getFullYear()-1); }
   for(const [key,value] of Object.entries(state.filters)) if(value!=='') params.set(key,value);
   try{
@@ -94,9 +96,10 @@ function renderCollectionState(){
   favoriteButton.classList.toggle('active',state.favoritesOnly);
   const chip=document.querySelector('#collectionChip');
   const activeFilters=Object.values(state.filters).filter(Boolean).length;
-  chip.hidden=!state.favoritesOnly&&!state.albumId&&!state.onThisDay&&!activeFilters;
-  document.querySelector('#collectionLabel').textContent=state.onThisDay?'В этот день':state.favoritesOnly?'Избранное':state.albumId?state.albumName:`Фильтры: ${activeFilters}`;
+  chip.hidden=!state.favoritesOnly&&!state.albumId&&!state.onThisDay&&!state.smartFilter&&!activeFilters;
+  document.querySelector('#collectionLabel').textContent=state.smartFilter?state.smartName:state.onThisDay?'В этот день':state.favoritesOnly?'Избранное':state.albumId?state.albumName:`Фильтры: ${activeFilters}`;
   document.querySelector('#todayButton').classList.toggle('active',state.onThisDay);
+  document.querySelector('#smartButton').classList.toggle('active',Boolean(state.smartFilter));
   document.querySelector('#filtersButton').classList.toggle('active',Boolean(activeFilters));
 }
 
@@ -130,7 +133,7 @@ function showMonths(entry,anchor){
   picker.hidden=false; const rect=anchor.getBoundingClientRect(); picker.style.top=`${Math.min(innerHeight-picker.offsetHeight-12,Math.max(74,rect.top-30))}px`;
 }
 function clearPeriod(){ state.year=null; state.month=null; state.undated=false; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; renderTimeline(); renderCollectionState(); load(true); }
-function clearCollection(){ state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false; state.filters={date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''}; renderCollectionState(); load(true); }
+function clearCollection(){ state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; state.filters={date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''}; renderCollectionState(); load(true); }
 
 function toggleSelection(id){
   if(state.selected.has(id)) state.selected.delete(id); else state.selected.add(id);
@@ -236,8 +239,46 @@ function renderAlbums(){
 }
 
 function selectAlbum(album){
-  state.albumId=album.id; state.albumName=album.name; state.favoritesOnly=false; state.onThisDay=false;
+  state.albumId=album.id; state.albumName=album.name; state.favoritesOnly=false; state.onThisDay=false; state.smartFilter=''; state.smartName='';
   document.querySelector('#albumsDialog').close(); renderCollectionState(); load(true);
+}
+
+async function openSmartCatalog(){
+  const dialog=document.querySelector('#smartDialog'); if(!dialog.open) dialog.showModal();
+  try{
+    const data=await api('/api/smart/catalog'); renderSmartCatalog(data);
+    clearTimeout(state.smartTimer);
+    if(data.progress.ready<data.progress.total) state.smartTimer=setTimeout(()=>{ if(dialog.open) openSmartCatalog(); },10000);
+  }catch(error){ document.querySelector('#smartProgress').textContent=error.message; }
+}
+
+function renderSmartCatalog(data){
+  const progress=data.progress; const percent=progress.total?Math.round(progress.ready/progress.total*100):100;
+  const status=progress.ready>=progress.total
+    ? `<strong>Каталог готов</strong> · обработано ${progress.ready.toLocaleString('ru-RU')} фотографий`
+    : `<strong>${percent}%</strong> · обработано ${progress.ready.toLocaleString('ru-RU')} из ${progress.total.toLocaleString('ru-RU')} · в очереди ${progress.pending.toLocaleString('ru-RU')}`;
+  const warning=progress.failed?` · ошибок: ${progress.failed.toLocaleString('ru-RU')}`:'';
+  const ocr=progress.ocrAvailable?'':' · распознавание текста недоступно';
+  document.querySelector('#smartProgress').innerHTML=status+warning+ocr;
+  const root=document.querySelector('#smartCollections'); root.innerHTML='';
+  for(const collection of data.collections){
+    const button=document.createElement('button'); button.className='smart-card'+(collection.coverUrl?' has-cover':''); button.disabled=!collection.count;
+    if(collection.coverUrl) button.style.backgroundImage=`url("${collection.coverUrl.replaceAll('"','%22')}")`;
+    button.innerHTML=`<span class="smart-card-icon">${escapeHtml(collection.icon)}</span><span class="smart-card-count">${collection.count.toLocaleString('ru-RU')}</span><strong>${escapeHtml(collection.name)}</strong><small>${escapeHtml(collection.description)}</small>`;
+    button.addEventListener('click',()=>selectSmartCollection(collection)); root.append(button);
+  }
+}
+
+function selectSmartCollection(collection){
+  state.smartFilter=collection.key; state.smartName=collection.name; state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false;
+  state.year=null; state.month=null; state.undated=false; document.querySelector('#smartDialog').close(); renderTimeline(); renderCollectionState(); load(true);
+}
+
+async function reindexSmartCatalog(){
+  if(!confirm('Переобработать все фотографии? Существующие результаты будут построены заново в фоне.')) return;
+  const button=document.querySelector('#smartReindex'); button.disabled=true;
+  try{ const result=await api('/api/smart/reindex',{method:'POST',body:'{}'}); toast(`В очередь добавлено: ${result.queued}`); await openSmartCatalog(); }
+  catch(error){ toast(error.message); } finally{ button.disabled=false; }
 }
 
 async function createAlbum(event){
@@ -375,11 +416,13 @@ document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>
 }));
 document.querySelector('#searchButton').addEventListener('click',()=>{ document.querySelector('#searchWrap').classList.add('open'); document.querySelector('#searchInput').focus(); });
 document.querySelector('#searchInput').addEventListener('input',debounce(event=>{ state.query=event.target.value; load(true); }));
-document.querySelector('#favoritesButton').addEventListener('click',()=>{ state.favoritesOnly=!state.favoritesOnly; state.albumId=null; state.albumName=''; state.onThisDay=false; renderCollectionState(); load(true); });
+document.querySelector('#favoritesButton').addEventListener('click',()=>{ state.favoritesOnly=!state.favoritesOnly; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; renderCollectionState(); load(true); });
+document.querySelector('#smartButton').addEventListener('click',openSmartCatalog);
+document.querySelector('#smartReindex').addEventListener('click',reindexSmartCatalog);
 document.querySelector('#albumsButton').addEventListener('click',async()=>{ try{ await fetchAlbums(); document.querySelector('#albumsDialog').showModal(); }catch(error){toast(error.message);} });
 document.querySelector('#mapButton').addEventListener('click',openMap);
 document.querySelector('#accountButton').addEventListener('click',openAccount);
-document.querySelector('#todayButton').addEventListener('click',()=>{ state.onThisDay=!state.onThisDay; state.year=null; state.month=null; state.undated=false; state.albumId=null; state.albumName=''; state.favoritesOnly=false; renderTimeline(); renderCollectionState(); load(true); });
+document.querySelector('#todayButton').addEventListener('click',()=>{ state.onThisDay=!state.onThisDay; state.year=null; state.month=null; state.undated=false; state.albumId=null; state.albumName=''; state.favoritesOnly=false; state.smartFilter=''; state.smartName=''; renderTimeline(); renderCollectionState(); load(true); });
 document.querySelector('#duplicatesButton').addEventListener('click',()=>openDuplicates('exact'));
 document.querySelectorAll('[data-duplicate-mode]').forEach(button=>button.addEventListener('click',()=>openDuplicates(button.dataset.duplicateMode)));
 document.querySelector('#filtersButton').addEventListener('click',openFilters);
@@ -405,6 +448,7 @@ document.querySelector('#nextItem').addEventListener('click',()=>move(1));
 document.querySelector('#favoriteCurrent').addEventListener('click',toggleFavorite);
 document.querySelector('#albumCurrent').addEventListener('click',openAlbumPicker);
 document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>document.querySelector('#'+button.dataset.close).close()));
+document.querySelector('#smartDialog').addEventListener('close',()=>clearTimeout(state.smartTimer));
 
 document.addEventListener('keydown',event=>{
   if(event.key==='Escape'&&document.querySelector('#searchWrap').classList.contains('open')&&!viewer.open) document.querySelector('#searchWrap').classList.remove('open');
