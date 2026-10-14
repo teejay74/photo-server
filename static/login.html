@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0d0e10">
+  <title>Вход · ФотоДом</title>
+  <link rel="stylesheet" href="/static/styles.css?v=11">
+</head>
+<body class="login-page">
+  <main class="login-main">
+    <section class="login-card">
+      <div class="brand login-brand"><span class="brand-mark">◉</span><span>ФотоДом</span></div>
+      <p class="eyebrow">ЛИЧНЫЙ ФОТОАРХИВ</p>
+      <h1>С возвращением</h1>
+      <p>Войдите в свой аккаунт, чтобы открыть фотографии.</p>
+      <form id="loginForm" class="login-form">
+        <label>Логин<input id="loginUsername" name="username" autocomplete="username" maxlength="40" required autofocus></label>
+        <label>Пароль<input id="loginPassword" name="password" type="password" autocomplete="current-password" maxlength="256" required></label>
+        <p id="loginError" class="login-error" role="alert" hidden></p>
+        <button type="submit">Войти</button>
+      </form>
+      <small class="login-note">После пяти неудачных попыток вход временно блокируется.</small>
+    </section>
+  </main>
+  <script src="/static/login.js?v=1" defer></script>
+</body>
+</html>

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import mimetypes
@@ -17,8 +16,9 @@ import tempfile
 import threading
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -28,11 +28,19 @@ try:
 except ImportError:  # The gallery still works, but EXIF and thumbnails are unavailable.
     Image = ImageOps = None
 
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerifyMismatchError
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 DATE_IN_NAME = re.compile(r"(20\d{2})(\d{2})(\d{2})[_-]?(\d{2})?(\d{2})?(\d{2})?")
 PHOTO_ID = re.compile(r"^[0-9a-f]{16}$")
+USERNAME = re.compile(r"^[A-Za-zА-Яа-яЁё0-9_.-]{3,40}$")
+ROLES = {"admin", "editor", "viewer"}
+ROLE_LEVEL = {"viewer": 1, "editor": 2, "admin": 3}
+PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
+DUMMY_PASSWORD_HASH = PASSWORD_HASHER.hash("photodom-invalid-password-placeholder")
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 
@@ -237,6 +245,36 @@ class GalleryDatabase:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('admin','editor','viewer')),
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    last_login TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    csrf_token TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+                CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires_at);
+
+                CREATE TABLE IF NOT EXISTS auth_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT,
+                    event TEXT NOT NULL,
+                    ip TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS auth_events_created_idx ON auth_events(created_at DESC);
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(photos)")}
@@ -246,6 +284,183 @@ class GalleryDatabase:
                 connection.execute("ALTER TABLE photos ADD COLUMN perceptual_hash TEXT")
             connection.execute("CREATE INDEX IF NOT EXISTS photos_content_hash_idx ON photos(content_hash)")
             connection.execute("CREATE INDEX IF NOT EXISTS photos_perceptual_hash_idx ON photos(perceptual_hash)")
+
+    @staticmethod
+    def _public_user(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"], "username": row["username"], "role": row["role"],
+            "active": bool(row["active"]), "createdAt": row["created_at"], "lastLogin": row["last_login"],
+        }
+
+    @staticmethod
+    def validate_username(username: str) -> str:
+        username = username.strip()
+        if not USERNAME.fullmatch(username):
+            raise ValueError("Логин: 3–40 символов, буквы, цифры, точка, дефис или подчёркивание")
+        return username
+
+    @staticmethod
+    def validate_password(password: str) -> str:
+        if len(password) < 10 or len(password) > 256:
+            raise ValueError("Пароль должен содержать от 10 до 256 символов")
+        return password
+
+    def bootstrap_admin(self, username: str, password: str) -> bool:
+        with self.connect() as connection:
+            if connection.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+                return False
+        username = self.validate_username(username)
+        # Eight characters keeps an existing Basic Auth deployment migratable;
+        # every password created or changed through the UI requires at least ten.
+        if len(password) < 8 or len(password) > 256:
+            raise ValueError("PHOTO_PASSWORD должен содержать от 8 до 256 символов")
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO users(username,password_hash,role,active,created_at) VALUES(?,?,?,?,?)",
+                (username, PASSWORD_HASHER.hash(password), "admin", 1, now),
+            )
+        print(f"Created initial administrator: {username}", flush=True)
+        return True
+
+    def users(self) -> list[dict]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id,username,role,active,created_at,last_login FROM users ORDER BY username COLLATE NOCASE"
+            ).fetchall()
+        return [self._public_user(row) for row in rows]
+
+    def create_user(self, username: str, password: str, role: str) -> dict:
+        username = self.validate_username(username)
+        password = self.validate_password(password)
+        if role not in ROLES:
+            raise ValueError("Некорректная роль")
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            with self.connect() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO users(username,password_hash,role,active,created_at) VALUES(?,?,?,?,?)",
+                    (username, PASSWORD_HASHER.hash(password), role, 1, now),
+                )
+                row = connection.execute(
+                    "SELECT id,username,role,active,created_at,last_login FROM users WHERE id=?", (cursor.lastrowid,)
+                ).fetchone()
+        except sqlite3.IntegrityError as error:
+            raise ValueError("Пользователь с таким логином уже существует") from error
+        return self._public_user(row)
+
+    def update_user(self, user_id: int, role: str | None = None, active: bool | None = None,
+                    password: str | None = None) -> dict:
+        if role is not None and role not in ROLES:
+            raise ValueError("Некорректная роль")
+        if password:
+            password = self.validate_password(password)
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            if not row:
+                raise KeyError("user")
+            new_role = role or row["role"]
+            new_active = bool(row["active"]) if active is None else bool(active)
+            if row["role"] == "admin" and bool(row["active"]) and (new_role != "admin" or not new_active):
+                admins = connection.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+                if admins <= 1:
+                    raise ValueError("Нельзя отключить или понизить последнего администратора")
+            updates, values = ["role=?", "active=?"], [new_role, int(new_active)]
+            if password:
+                updates.append("password_hash=?")
+                values.append(PASSWORD_HASHER.hash(password))
+            connection.execute(f"UPDATE users SET {','.join(updates)} WHERE id=?", [*values, user_id])
+            if not new_active or password:
+                connection.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            updated = connection.execute(
+                "SELECT id,username,role,active,created_at,last_login FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+        return self._public_user(updated)
+
+    def authenticate_user(self, username: str, password: str) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE", (username.strip(),)).fetchone()
+        if not row or not row["active"]:
+            try:
+                PASSWORD_HASHER.verify(DUMMY_PASSWORD_HASH, password)
+            except VerifyMismatchError:
+                pass
+            return None
+        try:
+            PASSWORD_HASHER.verify(row["password_hash"], password)
+        except (VerifyMismatchError, InvalidHashError):
+            return None
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute("UPDATE users SET last_login=? WHERE id=?", (now, row["id"]))
+            if PASSWORD_HASHER.check_needs_rehash(row["password_hash"]):
+                connection.execute("UPDATE users SET password_hash=? WHERE id=?", (PASSWORD_HASHER.hash(password), row["id"]))
+            fresh = connection.execute(
+                "SELECT id,username,role,active,created_at,last_login FROM users WHERE id=?", (row["id"],)
+            ).fetchone()
+        return self._public_user(fresh)
+
+    def create_session(self, user_id: int, ttl_days: int) -> dict:
+        token, csrf = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(days=ttl_days)
+        with self.connect() as connection:
+            connection.execute("DELETE FROM sessions WHERE expires_at<?", (now.isoformat(timespec="seconds"),))
+            connection.execute(
+                "INSERT INTO sessions(token_hash,user_id,csrf_token,created_at,expires_at,last_seen) VALUES(?,?,?,?,?,?)",
+                (hashlib.sha256(token.encode()).hexdigest(), user_id, csrf, now.isoformat(timespec="seconds"),
+                 expires.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")),
+            )
+        return {"token": token, "csrf": csrf, "expires": expires}
+
+    def session_user(self, token: str) -> dict | None:
+        if not token:
+            return None
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute("DELETE FROM sessions WHERE expires_at<?", (now,))
+            row = connection.execute(
+                """
+                SELECT u.id,u.username,u.role,u.active,u.created_at,u.last_login,s.csrf_token,s.expires_at
+                FROM sessions s JOIN users u ON u.id=s.user_id
+                WHERE s.token_hash=? AND u.active=1
+                """, (token_hash,),
+            ).fetchone()
+            if not row:
+                return None
+            connection.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?", (now, token_hash))
+        user = self._public_user(row)
+        user["csrf"] = row["csrf_token"]
+        user["expires"] = row["expires_at"]
+        return user
+
+    def delete_session(self, token: str) -> None:
+        if token:
+            with self.connect() as connection:
+                connection.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
+
+    def change_password(self, user_id: int, current_password: str, new_password: str) -> None:
+        new_password = self.validate_password(new_password)
+        with self.connect() as connection:
+            row = connection.execute("SELECT password_hash FROM users WHERE id=? AND active=1", (user_id,)).fetchone()
+            if not row:
+                raise KeyError("user")
+            try:
+                PASSWORD_HASHER.verify(row["password_hash"], current_password)
+            except (VerifyMismatchError, InvalidHashError) as error:
+                raise ValueError("Текущий пароль указан неверно") from error
+            connection.execute("UPDATE users SET password_hash=? WHERE id=?", (PASSWORD_HASHER.hash(new_password), user_id))
+            connection.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+
+    def record_auth_event(self, username: str, event: str, ip: str) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO auth_events(username,event,ip,created_at) VALUES(?,?,?,?)",
+                (username[:80], event[:40], ip[:80], now),
+            )
+            connection.execute("DELETE FROM auth_events WHERE id NOT IN (SELECT id FROM auth_events ORDER BY id DESC LIMIT 2000)")
 
     def refresh(self) -> dict:
         if not self.storage_available():
@@ -753,7 +968,7 @@ class GalleryDatabase:
 
 
 class GalleryHandler(BaseHTTPRequestHandler):
-    server_version = "PhotoGallery/3.0"
+    server_version = "PhotoGallery/4.0"
 
     @property
     def app(self):
@@ -762,34 +977,85 @@ class GalleryHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
-    def authenticated(self) -> bool:
-        if not self.app.username or not self.app.password:
-            return True
-        header = self.headers.get("Authorization", "")
-        if not header.startswith("Basic "):
-            return False
+    def session_token(self) -> str:
+        cookie = SimpleCookie()
         try:
-            supplied = base64.b64decode(header[6:]).decode("utf-8")
+            cookie.load(self.headers.get("Cookie", ""))
+            return cookie["photodom_session"].value if "photodom_session" in cookie else ""
         except Exception:
-            return False
-        return secrets.compare_digest(supplied, f"{self.app.username}:{self.app.password}")
+            return ""
 
-    def require_auth(self) -> bool:
-        if self.authenticated():
+    def authenticated(self) -> dict | None:
+        if hasattr(self, "_current_user"):
+            return self._current_user
+        self._session_token = self.session_token()
+        self._current_user = self.app.database.session_user(self._session_token)
+        return self._current_user
+
+    def require_auth(self, minimum_role: str = "viewer") -> bool:
+        user = self.authenticated()
+        if not user:
+            if urlparse(self.path).path.startswith("/api/"):
+                self.send_json({"error": "Требуется вход"}, HTTPStatus.UNAUTHORIZED)
+            else:
+                self.send_redirect("/login")
+            return False
+        if ROLE_LEVEL[user["role"]] < ROLE_LEVEL[minimum_role]:
+            self.send_json({"error": "Недостаточно прав"}, HTTPStatus.FORBIDDEN)
+            return False
+        return True
+
+    def require_csrf(self) -> bool:
+        user = self.authenticated()
+        supplied = self.headers.get("X-CSRF-Token", "")
+        if user and supplied and secrets.compare_digest(supplied, user["csrf"]):
             return True
-        self.send_response(HTTPStatus.UNAUTHORIZED)
-        self.send_header("WWW-Authenticate", 'Basic realm="Private photo gallery", charset="UTF-8"')
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        self.send_json({"error": "Некорректный CSRF-токен"}, HTTPStatus.FORBIDDEN)
         return False
 
-    def send_json(self, value, status=HTTPStatus.OK):
+    def send_redirect(self, location: str):
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.send_security_headers()
+        self.end_headers()
+
+    def send_security_headers(self):
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' https://unpkg.com; "
+            "style-src 'self' 'unsafe-inline' https://unpkg.com; "
+            "img-src 'self' data: blob: https://unpkg.com https://*.tile.openstreetmap.org; "
+            "media-src 'self' blob:; "
+            "connect-src 'self' https://*.tile.openstreetmap.org; "
+            "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+        )
+
+    def session_cookie(self, token: str, max_age: int) -> str:
+        cookie = SimpleCookie()
+        cookie["photodom_session"] = token
+        cookie["photodom_session"]["path"] = "/"
+        cookie["photodom_session"]["httponly"] = True
+        cookie["photodom_session"]["samesite"] = "Lax"
+        cookie["photodom_session"]["max-age"] = str(max_age)
+        if self.app.cookie_secure:
+            cookie["photodom_session"]["secure"] = True
+        return cookie.output(header="").strip()
+
+    def send_json(self, value, status=HTTPStatus.OK, headers: dict | None = None):
         data = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_security_headers()
+        for name, content in (headers or {}).items():
+            self.send_header(name, content)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
@@ -828,6 +1094,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "private, max-age=86400")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_security_headers()
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         if download:
@@ -928,16 +1195,36 @@ class GalleryHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/health":
+        path, params = parsed.path, parse_qs(parsed.query)
+        if path == "/health":
             available = self.app.database.storage_available()
             self.send_json(
                 {"status": "ok" if available else "storage_unavailable"},
                 HTTPStatus.OK if available else HTTPStatus.SERVICE_UNAVAILABLE,
             )
             return
+        if path in {"/login", "/static/login.js", "/static/styles.css"}:
+            if path == "/login" and self.authenticated():
+                self.send_redirect("/")
+                return
+            static_name = "login.html" if path == "/login" else path.removeprefix("/static/")
+            target = STATIC_DIR / static_name
+            content_type = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}[target.suffix]
+            self.send_file(target, content_type)
+            return
         if not self.require_auth():
             return
-        path, params = parsed.path, parse_qs(parsed.query)
+        if path == "/api/session":
+            user = dict(self.authenticated())
+            csrf = user.pop("csrf")
+            user.pop("expires", None)
+            self.send_json({"user": user, "csrf": csrf})
+            return
+        if path == "/api/users":
+            if not self.require_auth("admin"):
+                return
+            self.send_json({"users": self.app.database.users()})
+            return
         if path == "/api/photos":
             self.api_photos(params)
             return
@@ -961,6 +1248,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self.send_json({"groups": groups, "mode": mode, "index": self.app.database.hash_progress()})
             return
         if path == "/api/backups":
+            if not self.require_auth("admin"):
+                return
             self.send_json(self.app.database.backup_status())
             return
         if path == "/api/map":
@@ -997,40 +1286,114 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_file(target, {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}[target.suffix])
 
     def do_POST(self):
-        if not self.require_auth():
-            return
         path = urlparse(self.path).path
         try:
+            if path == "/api/auth/login":
+                body = self.read_json()
+                username, password = str(body.get("username", ""))[:80], str(body.get("password", ""))
+                ip, now = self.client_address[0], time.time()
+                with self.app.login_lock:
+                    attempts = [stamp for stamp in self.app.login_attempts.get(ip, []) if stamp > now - 900]
+                    self.app.login_attempts[ip] = attempts
+                    if len(attempts) >= 5:
+                        self.app.database.record_auth_event(username, "rate_limited", ip)
+                        self.send_json({"error": "Слишком много попыток. Повторите через 15 минут"}, HTTPStatus.TOO_MANY_REQUESTS)
+                        return
+                user = self.app.database.authenticate_user(username, password)
+                if not user:
+                    with self.app.login_lock:
+                        self.app.login_attempts.setdefault(ip, []).append(now)
+                    self.app.database.record_auth_event(username, "login_failed", ip)
+                    self.send_json({"error": "Неверный логин или пароль"}, HTTPStatus.UNAUTHORIZED)
+                    return
+                with self.app.login_lock:
+                    self.app.login_attempts.pop(ip, None)
+                session = self.app.database.create_session(user["id"], self.app.session_days)
+                self.app.database.record_auth_event(user["username"], "login_success", ip)
+                self.send_json(
+                    {"user": user, "csrf": session["csrf"]},
+                    headers={"Set-Cookie": self.session_cookie(session["token"], self.app.session_days * 86400)},
+                )
+                return
+            if not self.require_auth() or not self.require_csrf():
+                return
             body = self.read_json()
+            if path == "/api/auth/logout":
+                user = self.authenticated()
+                self.app.database.delete_session(self._session_token)
+                self.app.database.record_auth_event(user["username"], "logout", self.client_address[0])
+                self.send_json({"ok": True}, headers={"Set-Cookie": self.session_cookie("", 0)})
+                return
+            if path == "/api/account/password":
+                user = self.authenticated()
+                self.app.database.change_password(user["id"], str(body.get("currentPassword", "")), str(body.get("newPassword", "")))
+                self.app.database.record_auth_event(user["username"], "password_changed", self.client_address[0])
+                self.send_json({"ok": True}, headers={"Set-Cookie": self.session_cookie("", 0)})
+                return
+            if path == "/api/users":
+                if not self.require_auth("admin"):
+                    return
+                user = self.app.database.create_user(
+                    str(body.get("username", "")), str(body.get("password", "")), str(body.get("role", "viewer"))
+                )
+                self.send_json(user, HTTPStatus.CREATED)
+                return
+            user_match = re.fullmatch(r"/api/users/(\d+)", path)
+            if user_match:
+                if not self.require_auth("admin"):
+                    return
+                password = str(body.get("password", "")) or None
+                user = self.app.database.update_user(
+                    int(user_match.group(1)),
+                    str(body["role"]) if "role" in body else None,
+                    bool(body["active"]) if "active" in body else None,
+                    password,
+                )
+                self.send_json(user)
+                return
             favorite_match = re.fullmatch(r"/api/favorites/([0-9a-f]{16})", path)
             album_photo_match = re.fullmatch(r"/api/albums/(\d+)/photos/([0-9a-f]{16})", path)
             if favorite_match:
+                if not self.require_auth("editor"):
+                    return
                 value = self.app.database.set_favorite(favorite_match.group(1), bool(body.get("favorite", True)))
                 self.send_json({"favorite": value})
                 return
             if path == "/api/favorites/bulk":
+                if not self.require_auth("editor"):
+                    return
                 count = self.app.database.set_favorites(body.get("photoIds", []), bool(body.get("favorite", True)))
                 self.send_json({"count": count, "favorite": bool(body.get("favorite", True))})
                 return
             if path == "/api/favorites/import":
+                if not self.require_auth("editor"):
+                    return
                 count = self.app.database.import_favorites(body.get("photoIds", []))
                 self.send_json({"count": count})
                 return
             if path == "/api/albums":
+                if not self.require_auth("editor"):
+                    return
                 album = self.app.database.create_album(str(body.get("name", "")))
                 self.send_json(album, HTTPStatus.CREATED)
                 return
             if album_photo_match:
+                if not self.require_auth("editor"):
+                    return
                 included = self.app.database.set_album_photo(int(album_photo_match.group(1)), album_photo_match.group(2), bool(body.get("included", True)))
                 self.send_json({"included": included})
                 return
             album_photos_match = re.fullmatch(r"/api/albums/(\d+)/photos", path)
             if album_photos_match:
+                if not self.require_auth("editor"):
+                    return
                 included = bool(body.get("included", True))
                 count = self.app.database.set_album_photos(int(album_photos_match.group(1)), body.get("photoIds", []), included)
                 self.send_json({"included": included, "count": count})
                 return
             if path == "/api/backups":
+                if not self.require_auth("admin"):
+                    return
                 backup = self.app.database.create_backup(self.app.backup_retention)
                 self.send_json(backup, HTTPStatus.CREATED)
                 return
@@ -1072,7 +1435,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_json({"error": "Маршрут не найден"}, HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self):
-        if not self.require_auth():
+        if not self.require_auth("editor") or not self.require_csrf():
             return
         path = urlparse(self.path).path
         album_match = re.fullmatch(r"/api/albums/(\d+)", path)
@@ -1103,18 +1466,21 @@ def main():
     backup_interval = max(1, int(os.getenv("PHOTO_BACKUP_INTERVAL", "24")))
     marker_file = os.getenv("PHOTO_MARKER_FILE", ".photodom-storage")
     database = GalleryDatabase(photo_root, Path(args.database), Path(args.backups), marker_file)
+    database.bootstrap_admin(os.getenv("PHOTO_USER", "photos"), os.getenv("PHOTO_PASSWORD", ""))
     export_dir = Path(args.database).resolve().parent / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
     server = GalleryServer((args.host, args.port), GalleryHandler)
     server.app = argparse.Namespace(
         photo_root=photo_root,
         cache_dir=Path(args.cache).resolve(),
-        username=os.getenv("PHOTO_USER", "photos"),
-        password=os.getenv("PHOTO_PASSWORD", ""),
         thumbnail_slots=threading.Semaphore(2),
         database=database,
         export_dir=export_dir,
         backup_retention=backup_retention,
+        session_days=max(1, min(365, int(os.getenv("PHOTO_SESSION_DAYS", "30")))),
+        cookie_secure=os.getenv("PHOTO_COOKIE_SECURE", "false").lower() in {"1", "true", "yes"},
+        login_attempts={},
+        login_lock=threading.Lock(),
     )
 
     def refresh_periodically():

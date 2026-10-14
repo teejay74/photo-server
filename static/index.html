@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d0e10">
   <title>ФотоДом</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-  <link rel="stylesheet" href="/static/styles.css?v=10">
+  <link rel="stylesheet" href="/static/styles.css?v=11">
 </head>
 <body>
   <header class="topbar">
@@ -21,6 +21,7 @@
       <button class="icon-button" id="filtersButton" title="Фильтры и резервные копии" aria-label="Открыть фильтры">☷</button>
       <button class="icon-button" id="selectButton" title="Выбрать несколько" aria-label="Выбрать несколько фотографий">✓</button>
       <button class="icon-button" id="favoritesButton" title="Избранное" aria-label="Показать избранное">♡</button>
+      <button class="icon-button account-button" id="accountButton" title="Аккаунт" aria-label="Открыть аккаунт">●</button>
       <button class="icon-button" id="searchButton" title="Поиск" aria-label="Открыть поиск">⌕</button>
     </div>
   </header>
@@ -65,8 +66,8 @@
     <div class="viewer-bar">
       <div><strong id="viewerName"></strong><small id="viewerMeta"></small></div>
       <div class="viewer-actions">
-        <button id="albumCurrent" aria-label="Добавить в альбом" title="Добавить в альбом">＋</button>
-        <button id="favoriteCurrent" aria-label="Добавить в избранное">♡</button>
+        <button id="albumCurrent" data-min-role="editor" aria-label="Добавить в альбом" title="Добавить в альбом">＋</button>
+        <button id="favoriteCurrent" data-min-role="editor" aria-label="Добавить в избранное">♡</button>
         <a id="downloadCurrent" aria-label="Скачать" title="Скачать">↓</a>
         <button id="closeViewer" aria-label="Закрыть">×</button>
       </div>
@@ -79,7 +80,7 @@
   <dialog id="albumsDialog" class="panel-dialog">
     <section class="panel-shell">
       <header class="panel-header"><div><small>КОЛЛЕКЦИИ</small><h2>Альбомы</h2></div><button data-close="albumsDialog" aria-label="Закрыть">×</button></header>
-      <form id="albumForm" class="album-form">
+      <form id="albumForm" class="album-form" data-min-role="editor">
         <input id="albumName" maxlength="80" placeholder="Название нового альбома" autocomplete="off">
         <button type="submit">Создать</button>
       </form>
@@ -111,7 +112,7 @@
         <label>Размер до, МБ<input id="filterMax" type="number" min="0" step="0.1" placeholder="без ограничения"></label>
         <div class="form-actions wide"><button type="button" id="resetFilters">Сбросить</button><button type="submit">Применить</button></div>
       </form>
-      <section class="backup-box"><div><strong>Резервные копии базы</strong><small id="backupStatus">Проверяем…</small></div><button id="backupNow">Создать сейчас</button></section>
+      <section class="backup-box" data-min-role="admin"><div><strong>Резервные копии базы</strong><small id="backupStatus">Проверяем…</small></div><button id="backupNow">Создать сейчас</button></section>
     </section>
   </dialog>
 
@@ -124,16 +125,39 @@
     </section>
   </dialog>
 
+  <dialog id="accountDialog" class="panel-dialog account-dialog">
+    <section class="panel-shell">
+      <header class="panel-header"><div><small>БЕЗОПАСНОСТЬ</small><h2 id="accountTitle">Аккаунт</h2><p id="accountRole" class="account-role"></p></div><button data-close="accountDialog" aria-label="Закрыть">×</button></header>
+      <form id="passwordForm" class="account-form">
+        <h3>Сменить пароль</h3>
+        <label>Текущий пароль<input id="currentPassword" type="password" autocomplete="current-password" required></label>
+        <label>Новый пароль<input id="newPassword" type="password" minlength="10" maxlength="256" autocomplete="new-password" required></label>
+        <button type="submit">Сменить пароль</button>
+      </form>
+      <section class="users-section" data-min-role="admin">
+        <div class="section-heading"><div><small>АДМИНИСТРИРОВАНИЕ</small><h3>Пользователи</h3></div></div>
+        <form id="userForm" class="user-form">
+          <input id="newUsername" maxlength="40" placeholder="Логин" autocomplete="off" required>
+          <input id="newUserPassword" type="password" minlength="10" maxlength="256" placeholder="Пароль, минимум 10 символов" autocomplete="new-password" required>
+          <select id="newUserRole"><option value="viewer">Просмотр</option><option value="editor">Редактор</option><option value="admin">Администратор</option></select>
+          <button type="submit">Создать</button>
+        </form>
+        <div id="userList" class="user-list"></div>
+      </section>
+      <footer class="account-footer"><button id="logoutButton">Выйти из аккаунта</button></footer>
+    </section>
+  </dialog>
+
   <div id="selectionBar" class="selection-bar" hidden>
     <strong id="selectionCount">0 выбрано</strong>
-    <button id="selectFavorite">♥ В избранное</button>
-    <button id="selectAlbum">＋ В альбом</button>
+    <button id="selectFavorite" data-min-role="editor">♥ В избранное</button>
+    <button id="selectAlbum" data-min-role="editor">＋ В альбом</button>
     <button id="selectDownload">↓ ZIP</button>
     <button id="selectCancel">Отмена</button>
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
-  <script src="/static/app.js?v=8" defer></script>
+  <script src="/static/app.js?v=9" defer></script>
 </body>
 </html>

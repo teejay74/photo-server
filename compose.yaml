@@ -22,6 +22,8 @@ services:
       PHOTO_SCAN_INTERVAL: ${PHOTO_SCAN_INTERVAL:-300}
       PHOTO_USER: ${PHOTO_USER:-photos}
       PHOTO_PASSWORD: ${PHOTO_PASSWORD:?Set PHOTO_PASSWORD in .env}
+      PHOTO_SESSION_DAYS: ${PHOTO_SESSION_DAYS:-30}
+      PHOTO_COOKIE_SECURE: ${PHOTO_COOKIE_SECURE:-false}
     volumes:
       - type: bind
         source: ${PHOTO_DIR:-/srv/photos/xiaomi-13t/Camera}

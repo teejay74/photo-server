@@ -3,7 +3,7 @@ const state = {
   timeline: [], albums: [], albumId: null, albumName: '', loading: false, hasMore: true,
   favoritesOnly: false, onThisDay: false, current: -1, controller: null, map: null, mapLayer: null,
   filters: {date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''},
-  selecting: false, selected: new Set(), albumTargetIds: []
+  selecting: false, selected: new Set(), albumTargetIds: [], user: null, csrf: ''
 };
 
 const gallery = document.querySelector('#gallery');
@@ -18,9 +18,19 @@ const size = n => n < 1048576 ? `${Math.round(n/1024)} КБ` : `${(n/1048576).to
 function debounce(fn, wait=300){ let timer; return (...args) => { clearTimeout(timer); timer=setTimeout(()=>fn(...args),wait); }; }
 function escapeHtml(value){ const div=document.createElement('div'); div.textContent=value??''; return div.innerHTML; }
 function toast(message){ const root=document.querySelector('#toast'); root.textContent=message; root.classList.add('show'); clearTimeout(toast.timer); toast.timer=setTimeout(()=>root.classList.remove('show'),2300); }
+const roleLevel={viewer:1,editor:2,admin:3};
+const roleNames={viewer:'Просмотр',editor:'Редактор',admin:'Администратор'};
+function can(role){ return roleLevel[state.user?.role||'viewer']>=roleLevel[role]; }
+function applyPermissions(){
+  document.querySelectorAll('[data-min-role]').forEach(element=>element.hidden=!can(element.dataset.minRole));
+  const button=document.querySelector('#accountButton'); button.textContent=(state.user?.username||'?').slice(0,1).toUpperCase(); button.title=state.user?.username||'Аккаунт';
+}
 
 async function api(url, options={}){
-  const response=await fetch(url,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});
+  const method=(options.method||'GET').toUpperCase(); const headers={'Content-Type':'application/json',...(options.headers||{})};
+  if(method!=='GET'&&method!=='HEAD'&&state.csrf) headers['X-CSRF-Token']=state.csrf;
+  const response=await fetch(url,{...options,headers});
+  if(response.status===401){ location.replace('/login'); throw new Error('Сессия завершена'); }
   const data=await response.json().catch(()=>({}));
   if(!response.ok) throw new Error(data.error||`Ошибка ${response.status}`);
   return data;
@@ -41,6 +51,7 @@ async function load(reset=false){
   for(const [key,value] of Object.entries(state.filters)) if(value!=='') params.set(key,value);
   try{
     const response=await fetch('/api/photos?'+params,{signal:controller.signal});
+    if(response.status===401){ location.replace('/login'); return; }
     if(!response.ok) throw new Error('Ошибка загрузки');
     const data=await response.json();
     state.items.push(...data.items); state.total=data.total; state.offset+=data.items.length; state.hasMore=data.hasMore;
@@ -180,6 +191,7 @@ async function toggleFavorite(){
 }
 
 async function importBrowserFavorites(){
+  if(!can('editor')) return;
   if(localStorage.getItem('photo-favorites-imported-v2')) return;
   let ids=[];
   try{ ids=JSON.parse(localStorage.getItem('photo-favorites')||'[]'); }catch(_error){}
@@ -199,9 +211,9 @@ function renderAlbums(){
   for(const album of state.albums){
     const card=document.createElement('article'); card.className='album-card';
     const cover=album.coverUrl?`<img class="album-cover" src="${album.coverUrl}" alt="">`:'<span class="album-cover empty-cover">▣</span>';
-    card.innerHTML=`${cover}<div><strong>${escapeHtml(album.name)}</strong><small>${album.count.toLocaleString('ru-RU')} фото</small></div><button class="album-delete" title="Удалить альбом" aria-label="Удалить альбом">×</button>`;
+    card.innerHTML=`${cover}<div><strong>${escapeHtml(album.name)}</strong><small>${album.count.toLocaleString('ru-RU')} фото</small></div>${can('editor')?'<button class="album-delete" title="Удалить альбом" aria-label="Удалить альбом">×</button>':''}`;
     card.addEventListener('click',()=>selectAlbum(album));
-    card.querySelector('.album-delete').addEventListener('click',async event=>{
+    card.querySelector('.album-delete')?.addEventListener('click',async event=>{
       event.stopPropagation(); if(!confirm(`Удалить альбом «${album.name}»? Фотографии останутся в архиве.`)) return;
       try{ await api(`/api/albums/${album.id}`,{method:'DELETE'}); if(state.albumId===album.id) clearCollection(); await fetchAlbums(); toast('Альбом удалён'); }catch(error){ toast(error.message); }
     });
@@ -270,11 +282,11 @@ async function openMap(){
 
 async function openFilters(){
   try{
-    const [options,backups]=await Promise.all([api('/api/filters'),api('/api/backups')]);
+    const [options,backups]=await Promise.all([api('/api/filters'),can('admin')?api('/api/backups'):Promise.resolve({backups:[]})]);
     const camera=document.querySelector('#filterCamera'); camera.innerHTML='<option value="">Любая камера</option>';
     for(const entry of options.cameras){ const option=document.createElement('option'); option.value=entry.value; option.textContent=`${entry.value} · ${entry.count}`; camera.append(option); }
     for(const [key,id] of Object.entries({date_from:'filterDateFrom',date_to:'filterDateTo',camera:'filterCamera',gps:'filterGps',min_mb:'filterMin',max_mb:'filterMax'})) document.querySelector('#'+id).value=state.filters[key];
-    renderBackupStatus(backups); document.querySelector('#filtersDialog').showModal();
+    if(can('admin')) renderBackupStatus(backups); document.querySelector('#filtersDialog').showModal();
   }catch(error){ toast(error.message); }
 }
 function renderBackupStatus(data){
@@ -310,6 +322,40 @@ async function openDuplicates(mode='exact'){
   }catch(error){ root.innerHTML=`<div class="album-empty">${escapeHtml(error.message)}</div>`; }
 }
 
+async function openAccount(){
+  document.querySelector('#accountTitle').textContent=state.user.username;
+  document.querySelector('#accountRole').textContent=roleNames[state.user.role];
+  const dialog=document.querySelector('#accountDialog'); if(!dialog.open) dialog.showModal();
+  if(can('admin')){ try{ renderUsers((await api('/api/users')).users); }catch(error){ toast(error.message); } }
+}
+function renderUsers(users){
+  const root=document.querySelector('#userList'); root.innerHTML='';
+  for(const user of users){
+    const card=document.createElement('article'); card.className='user-card'; card.dataset.id=user.id;
+    card.innerHTML=`<div class="user-identity"><strong>${escapeHtml(user.username)}</strong><small>${user.lastLogin?'Последний вход: '+fullDate.format(new Date(user.lastLogin)):'Ещё не входил'}</small></div><select class="user-role"><option value="viewer">Просмотр</option><option value="editor">Редактор</option><option value="admin">Администратор</option></select><label class="user-active"><input type="checkbox" ${user.active?'checked':''}> Активен</label><input class="user-password" type="password" minlength="10" maxlength="256" placeholder="Новый пароль (необязательно)" autocomplete="new-password"><button class="user-save">Сохранить</button>`;
+    card.querySelector('.user-role').value=user.role;
+    card.querySelector('.user-save').addEventListener('click',async()=>{
+      const payload={role:card.querySelector('.user-role').value,active:card.querySelector('.user-active input').checked}; const password=card.querySelector('.user-password').value; if(password) payload.password=password;
+      try{ await api(`/api/users/${user.id}`,{method:'POST',body:JSON.stringify(payload)}); toast('Пользователь обновлён'); renderUsers((await api('/api/users')).users); }
+      catch(error){ toast(error.message); }
+    }); root.append(card);
+  }
+}
+async function createUser(event){
+  event.preventDefault();
+  const payload={username:document.querySelector('#newUsername').value,password:document.querySelector('#newUserPassword').value,role:document.querySelector('#newUserRole').value};
+  try{ await api('/api/users',{method:'POST',body:JSON.stringify(payload)}); event.target.reset(); renderUsers((await api('/api/users')).users); toast('Пользователь создан'); }
+  catch(error){ toast(error.message); }
+}
+async function changePassword(event){
+  event.preventDefault();
+  try{ await api('/api/account/password',{method:'POST',body:JSON.stringify({currentPassword:document.querySelector('#currentPassword').value,newPassword:document.querySelector('#newPassword').value})}); location.replace('/login'); }
+  catch(error){ toast(error.message); }
+}
+async function logout(){
+  try{ await api('/api/auth/logout',{method:'POST',body:'{}'}); }catch(_error){} location.replace('/login');
+}
+
 document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>{
   document.querySelector('.tab.active').classList.remove('active'); tab.classList.add('active'); state.type=tab.dataset.type; load(true);
 }));
@@ -318,6 +364,7 @@ document.querySelector('#searchInput').addEventListener('input',debounce(event=>
 document.querySelector('#favoritesButton').addEventListener('click',()=>{ state.favoritesOnly=!state.favoritesOnly; state.albumId=null; state.albumName=''; state.onThisDay=false; renderCollectionState(); load(true); });
 document.querySelector('#albumsButton').addEventListener('click',async()=>{ try{ await fetchAlbums(); document.querySelector('#albumsDialog').showModal(); }catch(error){toast(error.message);} });
 document.querySelector('#mapButton').addEventListener('click',openMap);
+document.querySelector('#accountButton').addEventListener('click',openAccount);
 document.querySelector('#todayButton').addEventListener('click',()=>{ state.onThisDay=!state.onThisDay; state.year=null; state.month=null; state.albumId=null; state.albumName=''; state.favoritesOnly=false; renderTimeline(); renderCollectionState(); load(true); });
 document.querySelector('#duplicatesButton').addEventListener('click',()=>openDuplicates('exact'));
 document.querySelectorAll('[data-duplicate-mode]').forEach(button=>button.addEventListener('click',()=>openDuplicates(button.dataset.duplicateMode)));
@@ -325,6 +372,9 @@ document.querySelector('#filtersButton').addEventListener('click',openFilters);
 document.querySelector('#filtersForm').addEventListener('submit',applyFilters);
 document.querySelector('#resetFilters').addEventListener('click',resetFilters);
 document.querySelector('#backupNow').addEventListener('click',backupNow);
+document.querySelector('#userForm').addEventListener('submit',createUser);
+document.querySelector('#passwordForm').addEventListener('submit',changePassword);
+document.querySelector('#logoutButton').addEventListener('click',logout);
 document.querySelector('#selectButton').addEventListener('click',()=>setSelecting(!state.selecting));
 document.querySelector('#selectCancel').addEventListener('click',()=>setSelecting(false));
 document.querySelector('#selectFavorite').addEventListener('click',bulkFavorite);
@@ -351,6 +401,7 @@ new IntersectionObserver(entries=>{ if(entries[0].isIntersecting) load(); },{roo
 
 async function initialize(){
   try{
+    const session=await api('/api/session'); state.user=session.user; state.csrf=session.csrf; applyPermissions();
     await importBrowserFavorites();
     const [stats,timeline]=await Promise.all([api('/api/stats'),api('/api/timeline'),fetchAlbums()]);
     const summary=document.querySelector('#summary');

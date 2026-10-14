@@ -1,5 +1,4 @@
 import argparse
-import base64
 import http.client
 import json
 import tempfile
@@ -91,68 +90,110 @@ class GalleryDatabaseTests(unittest.TestCase):
         self.assertEqual(total, 2)
         self.assertFalse(self.database.stats()["storageAvailable"])
 
+    def test_users_sessions_and_last_admin_protection(self):
+        self.assertTrue(self.database.bootstrap_admin("photos", "secret-password"))
+        self.assertFalse(self.database.bootstrap_admin("ignored", "another-password"))
+        self.assertIsNone(self.database.authenticate_user("photos", "wrong-password"))
+        admin = self.database.authenticate_user("photos", "secret-password")
+        self.assertEqual(admin["role"], "admin")
+        session = self.database.create_session(admin["id"], 30)
+        self.assertEqual(self.database.session_user(session["token"])["username"], "photos")
+        viewer = self.database.create_user("guest", "viewer-password", "viewer")
+        self.assertEqual(viewer["role"], "viewer")
+        with self.assertRaisesRegex(ValueError, "последнего администратора"):
+            self.database.update_user(admin["id"], role="viewer")
+        self.database.delete_session(session["token"])
+        self.assertIsNone(self.database.session_user(session["token"]))
+
     def test_http_api_auth_favorites_and_albums(self):
+        self.database.bootstrap_admin("photos", "secret-password")
         server = GalleryServer(("127.0.0.1", 0), GalleryHandler)
         server.app = argparse.Namespace(
             photo_root=self.root,
             cache_dir=Path(self.temporary.name) / "cache",
-            username="photos",
-            password="secret",
             thumbnail_slots=threading.Semaphore(1),
             database=self.database,
             export_dir=Path(self.temporary.name) / "exports",
             backup_retention=2,
+            session_days=30,
+            cookie_secure=False,
+            login_attempts={},
+            login_lock=threading.Lock(),
         )
         server.app.export_dir.mkdir()
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         port = server.server_address[1]
-        authorization = "Basic " + base64.b64encode(b"photos:secret").decode()
+        session_cookie, csrf = "", ""
 
-        def request(method, path, body=None, authenticated=True):
+        def request(method, path, body=None, authenticated=True, csrf_protected=True, cookie_override=None, csrf_override=None):
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             headers = {"Content-Type": "application/json"}
             if authenticated:
-                headers["Authorization"] = authorization
+                selected_cookie = session_cookie if cookie_override is None else cookie_override
+                if selected_cookie:
+                    headers["Cookie"] = selected_cookie
+                selected_csrf = csrf if csrf_override is None else csrf_override
+                if method not in {"GET", "HEAD"} and csrf_protected and selected_csrf:
+                    headers["X-CSRF-Token"] = selected_csrf
             payload = json.dumps(body).encode() if body is not None else None
             connection.request(method, path, body=payload, headers=headers)
             response = connection.getresponse()
             data = json.loads(response.read()) if response.getheader("Content-Type", "").startswith("application/json") else None
+            response_headers = dict(response.getheaders())
             connection.close()
-            return response.status, data
+            return response.status, data, response_headers
 
         try:
-            status, _ = request("GET", "/api/stats", authenticated=False)
+            status, _, _ = request("GET", "/api/stats", authenticated=False)
             self.assertEqual(status, 401)
-            status, data = request("GET", "/health", authenticated=False)
+            status, data, _ = request("GET", "/health", authenticated=False)
             self.assertEqual((status, data["status"]), (200, "ok"))
-            status, data = request("GET", "/api/photos?limit=10&type=image")
+            status, data, headers = request("POST", "/api/auth/login", {"username": "photos", "password": "secret-password"}, authenticated=False)
+            self.assertEqual(status, 200)
+            self.assertIn("HttpOnly", headers["Set-Cookie"])
+            self.assertIn("SameSite=Lax", headers["Set-Cookie"])
+            self.assertEqual(headers["X-Frame-Options"], "DENY")
+            session_cookie = headers["Set-Cookie"].split(";", 1)[0]
+            csrf = data["csrf"]
+            status, data, _ = request("GET", "/api/session")
+            self.assertEqual((status, data["user"]["role"]), (200, "admin"))
+            status, data, _ = request("GET", "/api/photos?limit=10&type=image")
             self.assertEqual(status, 200)
             photo_id = data["items"][0]["id"]
 
-            status, data = request("POST", f"/api/favorites/{photo_id}", {"favorite": True})
+            status, _, _ = request("POST", f"/api/favorites/{photo_id}", {"favorite": True}, csrf_protected=False)
+            self.assertEqual(status, 403)
+            status, data, _ = request("POST", f"/api/favorites/{photo_id}", {"favorite": True})
             self.assertEqual((status, data["favorite"]), (200, True))
-            status, data = request("POST", "/api/albums", {"name": "Поездка"})
+            status, data, _ = request("POST", "/api/albums", {"name": "Поездка"})
             self.assertEqual(status, 201)
             album_id = data["id"]
-            status, data = request("POST", f"/api/albums/{album_id}/photos/{photo_id}", {"included": True})
+            status, data, _ = request("POST", f"/api/albums/{album_id}/photos/{photo_id}", {"included": True})
             self.assertEqual((status, data["included"]), (200, True))
-            status, data = request("GET", f"/api/photos?album={album_id}")
+            status, data, _ = request("GET", f"/api/photos?album={album_id}")
             self.assertEqual((status, data["total"]), (200, 1))
-            status, data = request("GET", "/api/albums")
+            status, data, _ = request("GET", "/api/albums")
             self.assertEqual((status, data["albums"][0]["count"]), (200, 1))
-            status, data = request("POST", "/api/favorites/bulk", {"photoIds": [photo_id], "favorite": True})
+            status, data, _ = request("POST", "/api/favorites/bulk", {"photoIds": [photo_id], "favorite": True})
             self.assertEqual((status, data["count"]), (200, 1))
-            status, data = request("POST", f"/api/albums/{album_id}/photos", {"photoIds": [photo_id], "included": True})
+            status, data, _ = request("POST", f"/api/albums/{album_id}/photos", {"photoIds": [photo_id], "included": True})
             self.assertEqual((status, data["count"]), (200, 1))
-            status, data = request("GET", "/api/filters")
+            status, data, _ = request("GET", "/api/filters")
             self.assertEqual((status, data["cameras"][0]["value"]), (200, "Test Camera"))
-            status, data = request("GET", "/api/duplicates?mode=exact")
+            status, data, _ = request("GET", "/api/duplicates?mode=exact")
             self.assertEqual((status, data["groups"]), (200, []))
-            status, data = request("POST", "/api/backups", {})
+            status, data, _ = request("POST", "/api/backups", {})
             self.assertEqual(status, 201)
-            status, _ = request("POST", "/api/download/zip", {"photoIds": [photo_id]})
+            status, _, _ = request("POST", "/api/download/zip", {"photoIds": [photo_id]})
             self.assertEqual(status, 200)
+
+            status, _, _ = request("POST", "/api/users", {"username": "guest", "password": "viewer-password", "role": "viewer"})
+            self.assertEqual(status, 201)
+            status, viewer_data, viewer_headers = request("POST", "/api/auth/login", {"username": "guest", "password": "viewer-password"}, authenticated=False)
+            viewer_cookie = viewer_headers["Set-Cookie"].split(";", 1)[0]
+            status, _, _ = request("POST", f"/api/favorites/{photo_id}", {"favorite": False}, cookie_override=viewer_cookie, csrf_override=viewer_data["csrf"])
+            self.assertEqual(status, 403)
         finally:
             server.shutdown()
             server.server_close()
