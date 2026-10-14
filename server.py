@@ -43,6 +43,15 @@ PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 DUMMY_PASSWORD_HASH = PASSWORD_HASHER.hash("photodom-invalid-password-placeholder")
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+STATIC_FILES = {
+    "index.html", "app.js", "styles.css",
+    "vendor/leaflet/leaflet.js", "vendor/leaflet/leaflet.js.map", "vendor/leaflet/leaflet.css",
+    "vendor/leaflet/images/marker-icon.png",
+    "vendor/leaflet/images/marker-icon-2x.png",
+    "vendor/leaflet/images/marker-shadow.png",
+    "vendor/leaflet/images/layers.png",
+    "vendor/leaflet/images/layers-2x.png",
+}
 
 
 def safe_join(root: Path, relative: str) -> Path | None:
@@ -1027,9 +1036,9 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; "
-            "script-src 'self' https://unpkg.com; "
-            "style-src 'self' 'unsafe-inline' https://unpkg.com; "
-            "img-src 'self' data: blob: https://unpkg.com https://*.tile.openstreetmap.org; "
+            "script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob: https://*.tile.openstreetmap.org; "
             "media-src 'self' blob:; "
             "connect-src 'self' https://*.tile.openstreetmap.org; "
             "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
@@ -1284,11 +1293,16 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self.thumbnail(path[len("/thumb/"):])
             return
         static_name = "index.html" if path == "/" else path.removeprefix("/static/")
-        if static_name not in {"index.html", "app.js", "styles.css"}:
+        if static_name not in STATIC_FILES:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         target = STATIC_DIR / static_name
-        self.send_file(target, {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}[target.suffix])
+        content_type = {
+            ".html": "text/html; charset=utf-8",
+            ".js": "text/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+        }.get(target.suffix)
+        self.send_file(target, content_type)
 
     def do_POST(self):
         path = urlparse(self.path).path

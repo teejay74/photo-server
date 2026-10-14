@@ -158,6 +158,11 @@ class GalleryDatabaseTests(unittest.TestCase):
             csrf = data["csrf"]
             status, data, _ = request("GET", "/api/session")
             self.assertEqual((status, data["user"]["role"]), (200, "admin"))
+            status, _, headers = request("GET", "/static/vendor/leaflet/leaflet.js")
+            self.assertEqual(status, 200)
+            self.assertNotIn("unpkg.com", headers["Content-Security-Policy"])
+            status, _, _ = request("GET", "/static/vendor/leaflet/images/marker-icon.png")
+            self.assertEqual(status, 200)
             status, data, _ = request("GET", "/api/photos?limit=10&type=image")
             self.assertEqual(status, 200)
             photo_id = data["items"][0]["id"]
