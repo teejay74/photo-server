@@ -3,6 +3,7 @@ const state = {
   timeline: [], undatedCount: 0, albums: [], albumId: null, albumName: '', loading: false, hasMore: true,
   favoritesOnly: false, onThisDay: false, current: -1, controller: null, map: null, mapLayer: null,
   smartFilter: '', smartName: '', smartTimer: null,
+  people: [], personId: null, personName: '', activePerson: null,
   filters: {date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''},
   selecting: false, selected: new Set(), albumTargetIds: [], user: null, csrf: ''
 };
@@ -50,6 +51,7 @@ async function load(reset=false){
   if(state.favoritesOnly) params.set('favorite','1');
   if(state.albumId) params.set('album',state.albumId);
   if(state.smartFilter) params.set('smart',state.smartFilter);
+  if(state.personId) params.set('person',state.personId);
   if(state.onThisDay){ const now=new Date(); params.set('month',now.getMonth()+1); params.set('day',now.getDate()); params.set('before_year',now.getFullYear()-1); }
   for(const [key,value] of Object.entries(state.filters)) if(value!=='') params.set(key,value);
   try{
@@ -96,8 +98,8 @@ function renderCollectionState(){
   favoriteButton.classList.toggle('active',state.favoritesOnly);
   const chip=document.querySelector('#collectionChip');
   const activeFilters=Object.values(state.filters).filter(Boolean).length;
-  chip.hidden=!state.favoritesOnly&&!state.albumId&&!state.onThisDay&&!state.smartFilter&&!activeFilters;
-  document.querySelector('#collectionLabel').textContent=state.smartFilter?state.smartName:state.onThisDay?'В этот день':state.favoritesOnly?'Избранное':state.albumId?state.albumName:`Фильтры: ${activeFilters}`;
+  chip.hidden=!state.favoritesOnly&&!state.albumId&&!state.onThisDay&&!state.smartFilter&&!state.personId&&!activeFilters;
+  document.querySelector('#collectionLabel').textContent=state.personId?state.personName:state.smartFilter?state.smartName:state.onThisDay?'В этот день':state.favoritesOnly?'Избранное':state.albumId?state.albumName:`Фильтры: ${activeFilters}`;
   document.querySelector('#todayButton').classList.toggle('active',state.onThisDay);
   document.querySelector('#smartButton').classList.toggle('active',Boolean(state.smartFilter));
   document.querySelector('#filtersButton').classList.toggle('active',Boolean(activeFilters));
@@ -133,7 +135,7 @@ function showMonths(entry,anchor){
   picker.hidden=false; const rect=anchor.getBoundingClientRect(); picker.style.top=`${Math.min(innerHeight-picker.offsetHeight-12,Math.max(74,rect.top-30))}px`;
 }
 function clearPeriod(){ state.year=null; state.month=null; state.undated=false; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; renderTimeline(); renderCollectionState(); load(true); }
-function clearCollection(){ state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; state.filters={date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''}; renderCollectionState(); load(true); }
+function clearCollection(){ state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; state.personId=null; state.personName=''; state.filters={date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''}; renderCollectionState(); load(true); }
 
 function toggleSelection(id){
   if(state.selected.has(id)) state.selected.delete(id); else state.selected.add(id);
@@ -174,6 +176,7 @@ function openViewer(index){
   if(item.width&&item.height) metadata.push(`${item.width}×${item.height}`);
   if(item.cameraModel) metadata.push(item.cameraModel);
   if(item.latitude!=null) metadata.push('есть геопозиция');
+  if(item.faceCount) metadata.push(`лиц: ${item.faceCount}`);
   document.querySelector('#viewerMeta').textContent=metadata.join(' · ');
   document.querySelector('#downloadCurrent').href='/download/'+item.path.split('/').map(encodeURIComponent).join('/');
   document.querySelector('#favoriteCurrent').textContent=item.favorite?'♥':'♡';
@@ -239,7 +242,7 @@ function renderAlbums(){
 }
 
 function selectAlbum(album){
-  state.albumId=album.id; state.albumName=album.name; state.favoritesOnly=false; state.onThisDay=false; state.smartFilter=''; state.smartName='';
+  state.albumId=album.id; state.albumName=album.name; state.favoritesOnly=false; state.onThisDay=false; state.smartFilter=''; state.smartName=''; state.personId=null; state.personName='';
   document.querySelector('#albumsDialog').close(); renderCollectionState(); load(true);
 }
 
@@ -261,6 +264,9 @@ function renderSmartCatalog(data){
   const ocr=progress.ocrAvailable?'':' · распознавание текста недоступно';
   document.querySelector('#smartProgress').innerHTML=status+warning+ocr;
   const root=document.querySelector('#smartCollections'); root.innerHTML='';
+  const faces=data.faces||{}; const people=document.createElement('button'); people.className='smart-card';
+  people.innerHTML=`<span class="smart-card-icon">☺</span><span class="smart-card-count">${(faces.people||0).toLocaleString('ru-RU')}</span><strong>Люди</strong><small>${faces.ready>=faces.total?'Группы лиц готовы':`Обработано ${faces.ready||0} из ${faces.total||0} фотографий`}</small>`;
+  people.addEventListener('click',openPeople); root.append(people);
   for(const collection of data.collections){
     const button=document.createElement('button'); button.className='smart-card'+(collection.coverUrl?' has-cover':''); button.disabled=!collection.count;
     if(collection.coverUrl) button.style.backgroundImage=`url("${collection.coverUrl.replaceAll('"','%22')}")`;
@@ -271,7 +277,74 @@ function renderSmartCatalog(data){
 
 function selectSmartCollection(collection){
   state.smartFilter=collection.key; state.smartName=collection.name; state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false;
-  state.year=null; state.month=null; state.undated=false; document.querySelector('#smartDialog').close(); renderTimeline(); renderCollectionState(); load(true);
+  state.personId=null; state.personName=''; state.year=null; state.month=null; state.undated=false; document.querySelector('#smartDialog').close(); renderTimeline(); renderCollectionState(); load(true);
+}
+
+async function openPeople(){
+  if(document.querySelector('#smartDialog').open) document.querySelector('#smartDialog').close();
+  const dialog=document.querySelector('#peopleDialog'); if(!dialog.open) dialog.showModal();
+  const root=document.querySelector('#peopleList'); root.innerHTML='<div class="album-empty">Загружаем людей…</div>';
+  try{
+    const data=await api('/api/people'); state.people=data.people; const progress=data.progress;
+    document.querySelector('#peopleProgress').textContent=progress.ready>=progress.total
+      ? `${progress.faces.toLocaleString('ru-RU')} лиц · ${progress.people.toLocaleString('ru-RU')} групп`
+      : `Обработано ${progress.ready.toLocaleString('ru-RU')} из ${progress.total.toLocaleString('ru-RU')} фотографий · найдено лиц: ${progress.faces.toLocaleString('ru-RU')}`;
+    root.innerHTML='';
+    if(!state.people.length){ root.innerHTML='<div class="album-empty">Лица пока не найдены. Фоновая обработка продолжается.</div>'; return; }
+    for(const person of state.people){
+      const card=document.createElement('article'); card.className='person-card';
+      card.innerHTML=`<button><img loading="lazy" src="${person.coverUrl}" alt=""><span class="person-card-info"><strong>${escapeHtml(person.name)}</strong><small>${person.photoCount.toLocaleString('ru-RU')} фото · ${person.faceCount.toLocaleString('ru-RU')} лиц</small></span></button>${can('editor')?'<button class="person-review" title="Проверить группу">⋯</button>':''}`;
+      card.querySelector('button:first-child').addEventListener('click',()=>selectPerson(person));
+      card.querySelector('.person-review')?.addEventListener('click',()=>openPersonFaces(person)); root.append(card);
+    }
+  }catch(error){ root.innerHTML=`<div class="album-empty">${escapeHtml(error.message)}</div>`; }
+}
+
+function selectPerson(person){
+  state.personId=person.id; state.personName=person.name; state.smartFilter=''; state.smartName=''; state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false;
+  state.year=null; state.month=null; state.undated=false; document.querySelector('#peopleDialog').close(); renderTimeline(); renderCollectionState(); load(true);
+}
+
+async function openPersonFaces(person){
+  state.activePerson=person; document.querySelector('#personFacesTitle').textContent=person.name;
+  const dialog=document.querySelector('#personFacesDialog'); if(!dialog.open) dialog.showModal();
+  const root=document.querySelector('#personFacesList'); root.innerHTML='<div class="album-empty">Загружаем лица…</div>';
+  try{
+    const data=await api(`/api/people/${person.id}/faces`); root.innerHTML='';
+    for(const face of data.faces){
+      const card=document.createElement('figure'); card.className='face-card';
+      card.innerHTML=`<img loading="lazy" src="${face.thumbUrl}" alt=""><figcaption>${tileDate.format(new Date(face.taken))}${can('editor')?'<button class="face-move">Перенести…</button>':''}</figcaption>`;
+      card.querySelector('.face-move')?.addEventListener('click',()=>moveFace(face)); root.append(card);
+    }
+  }catch(error){ root.innerHTML=`<div class="album-empty">${escapeHtml(error.message)}</div>`; }
+}
+
+async function renameActivePerson(){
+  const person=state.activePerson; if(!person) return; const name=prompt('Имя человека',person.named?person.name:''); if(name===null||!name.trim()) return;
+  try{ const updated=await api(`/api/people/${person.id}`,{method:'POST',body:JSON.stringify({name})}); state.activePerson=updated; document.querySelector('#personFacesTitle').textContent=updated.name; toast('Имя сохранено'); await openPeople(); }
+  catch(error){ toast(error.message); }
+}
+
+async function mergeActivePerson(){
+  const source=state.activePerson; if(!source) return; const answer=prompt('Введите имя или номер группы, с которой объединить'); if(answer===null||!answer.trim()) return;
+  const needle=answer.trim().toLocaleLowerCase('ru-RU'); const target=state.people.find(person=>String(person.id)===needle||person.name.toLocaleLowerCase('ru-RU')===needle);
+  if(!target||target.id===source.id){ toast('Подходящая другая группа не найдена'); return; }
+  if(!confirm(`Объединить «${source.name}» с «${target.name}»?`)) return;
+  try{ await api('/api/people/merge',{method:'POST',body:JSON.stringify({sourceId:source.id,targetId:target.id})}); document.querySelector('#personFacesDialog').close(); toast('Группы объединены'); await openPeople(); }
+  catch(error){ toast(error.message); }
+}
+
+async function moveFace(face){
+  const answer=prompt('Введите имя или номер другой группы. Оставьте пустым, чтобы создать новую.'); if(answer===null) return;
+  let target=null; if(answer.trim()){ const needle=answer.trim().toLocaleLowerCase('ru-RU'); target=state.people.find(person=>String(person.id)===needle||person.name.toLocaleLowerCase('ru-RU')===needle); if(!target){ toast('Группа не найдена'); return; } }
+  try{ await api(`/api/faces/${face.id}`,{method:'POST',body:JSON.stringify({personId:target?.id??null})}); toast(target?'Лицо перенесено':'Создана новая группа'); await openPersonFaces(state.activePerson); }
+  catch(error){ toast(error.message); }
+}
+
+async function reindexFaces(){
+  if(!confirm('Заново найти и сгруппировать все лица? Имена и ручные исправления будут удалены.')) return;
+  try{ const data=await api('/api/faces/reindex',{method:'POST',body:'{}'}); toast(`В очередь добавлено: ${data.queued}`); await openPeople(); }
+  catch(error){ toast(error.message); }
 }
 
 async function reindexSmartCatalog(){
@@ -419,13 +492,16 @@ document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>
 }));
 document.querySelector('#searchButton').addEventListener('click',()=>{ document.querySelector('#searchWrap').classList.add('open'); document.querySelector('#searchInput').focus(); });
 document.querySelector('#searchInput').addEventListener('input',debounce(event=>{ state.query=event.target.value; load(true); }));
-document.querySelector('#favoritesButton').addEventListener('click',()=>{ state.favoritesOnly=!state.favoritesOnly; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; renderCollectionState(); load(true); });
+document.querySelector('#favoritesButton').addEventListener('click',()=>{ state.favoritesOnly=!state.favoritesOnly; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; state.personId=null; state.personName=''; renderCollectionState(); load(true); });
 document.querySelector('#smartButton').addEventListener('click',openSmartCatalog);
 document.querySelector('#smartReindex').addEventListener('click',reindexSmartCatalog);
+document.querySelector('#facesReindex').addEventListener('click',reindexFaces);
+document.querySelector('#renamePerson').addEventListener('click',renameActivePerson);
+document.querySelector('#mergePerson').addEventListener('click',mergeActivePerson);
 document.querySelector('#albumsButton').addEventListener('click',async()=>{ try{ await fetchAlbums(); document.querySelector('#albumsDialog').showModal(); }catch(error){toast(error.message);} });
 document.querySelector('#mapButton').addEventListener('click',openMap);
 document.querySelector('#accountButton').addEventListener('click',openAccount);
-document.querySelector('#todayButton').addEventListener('click',()=>{ state.onThisDay=!state.onThisDay; state.year=null; state.month=null; state.undated=false; state.albumId=null; state.albumName=''; state.favoritesOnly=false; state.smartFilter=''; state.smartName=''; renderTimeline(); renderCollectionState(); load(true); });
+document.querySelector('#todayButton').addEventListener('click',()=>{ state.onThisDay=!state.onThisDay; state.year=null; state.month=null; state.undated=false; state.albumId=null; state.albumName=''; state.favoritesOnly=false; state.smartFilter=''; state.smartName=''; state.personId=null; state.personName=''; renderTimeline(); renderCollectionState(); load(true); });
 document.querySelector('#duplicatesButton').addEventListener('click',()=>openDuplicates('exact'));
 document.querySelectorAll('[data-duplicate-mode]').forEach(button=>button.addEventListener('click',()=>openDuplicates(button.dataset.duplicateMode)));
 document.querySelector('#filtersButton').addEventListener('click',openFilters);

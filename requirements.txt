@@ -1,2 +1,3 @@
 Pillow>=10.0,<13.0
 argon2-cffi>=23.1,<26.0
+opencv-python-headless>=4.10,<5.0

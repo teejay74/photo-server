@@ -37,6 +37,13 @@ except ImportError:  # Smart analysis is optional outside the Docker image.
     def tesseract_available():
         return False
 
+try:
+    from face_catalog import FACE_MATCH_THRESHOLD, FACE_MODEL_VERSION, embedding_array, get_engine
+except ImportError:
+    FACE_MATCH_THRESHOLD = 1.0
+    FACE_MODEL_VERSION = 0
+    embedding_array = get_engine = None
+
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
@@ -290,6 +297,41 @@ class GalleryDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS smart_jobs_status_idx ON smart_jobs(status, updated_at);
 
+                CREATE TABLE IF NOT EXISTS people (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT COLLATE NOCASE UNIQUE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS faces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    photo_id TEXT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                    person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+                    model_version INTEGER NOT NULL,
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    confidence REAL NOT NULL,
+                    embedding BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(photo_id,x,y,width,height,model_version)
+                );
+                CREATE INDEX IF NOT EXISTS faces_photo_idx ON faces(photo_id);
+                CREATE INDEX IF NOT EXISTS faces_person_idx ON faces(person_id);
+
+                CREATE TABLE IF NOT EXISTS face_jobs (
+                    photo_id TEXT PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+                    model_version INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','running','done','failed')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    faces_found INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS face_jobs_status_idx ON face_jobs(status, updated_at);
+
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -347,6 +389,24 @@ class GalleryDatabase:
                         updated_at=CASE WHEN smart_jobs.model_version!=excluded.model_version THEN excluded.updated_at ELSE smart_jobs.updated_at END
                     """,
                     (SMART_MODEL_VERSION, now, SMART_MODEL_VERSION),
+                )
+            connection.execute(
+                "UPDATE face_jobs SET status='pending',updated_at=? WHERE status='running'", (now,)
+            )
+            if FACE_MODEL_VERSION:
+                connection.execute(
+                    """
+                    INSERT INTO face_jobs(photo_id,model_version,status,attempts,updated_at)
+                    SELECT p.id,?,'pending',0,? FROM photos p
+                    LEFT JOIN face_jobs j ON j.photo_id=p.id AND j.model_version=?
+                    WHERE p.type='image' AND j.photo_id IS NULL
+                    ON CONFLICT(photo_id) DO UPDATE SET
+                        model_version=excluded.model_version,
+                        status=CASE WHEN face_jobs.model_version!=excluded.model_version THEN 'pending' ELSE face_jobs.status END,
+                        attempts=CASE WHEN face_jobs.model_version!=excluded.model_version THEN 0 ELSE face_jobs.attempts END,
+                        updated_at=CASE WHEN face_jobs.model_version!=excluded.model_version THEN excluded.updated_at ELSE face_jobs.updated_at END
+                    """,
+                    (FACE_MODEL_VERSION, now, FACE_MODEL_VERSION),
                 )
 
     @staticmethod
@@ -627,8 +687,24 @@ class GalleryDatabase:
                             """,
                             ((item["id"], SMART_MODEL_VERSION, now) for item in smart_changed),
                         )
+                    if smart_changed and FACE_MODEL_VERSION:
+                        connection.executemany(
+                            "DELETE FROM faces WHERE photo_id=?",
+                            ((item["id"],) for item in smart_changed),
+                        )
+                        connection.executemany(
+                            """
+                            INSERT INTO face_jobs(photo_id,model_version,status,attempts,faces_found,error,updated_at)
+                            VALUES(?,?,'pending',0,0,NULL,?)
+                            ON CONFLICT(photo_id) DO UPDATE SET
+                                model_version=excluded.model_version,status='pending',attempts=0,
+                                faces_found=0,error=NULL,updated_at=excluded.updated_at
+                            """,
+                            ((item["id"], FACE_MODEL_VERSION, now) for item in smart_changed),
+                        )
                 if removed:
                     connection.executemany("DELETE FROM photos WHERE path=?", ((path,) for path in removed))
+                connection.execute("DELETE FROM people WHERE NOT EXISTS(SELECT 1 FROM faces f WHERE f.person_id=people.id)")
                 connection.execute(
                     "INSERT INTO app_meta(key,value) VALUES('last_scan',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (now,),
@@ -832,7 +908,7 @@ class GalleryDatabase:
                     "key": key, "name": name, "description": description, "icon": icon,
                     "count": row["count"], "cover": cover_row["path"] if cover_row else None,
                 })
-        return {"collections": collections, "progress": self.smart_progress()}
+        return {"collections": collections, "progress": self.smart_progress(), "faces": self.face_progress()}
 
     def queue_smart_reindex(self, failed_only: bool = False) -> int:
         if not SMART_MODEL_VERSION:
@@ -856,10 +932,235 @@ class GalleryDatabase:
             )
             return cursor.rowcount
 
+    def analyze_faces_next(self, model_dir: Path) -> dict:
+        if not FACE_MODEL_VERSION or get_engine is None or embedding_array is None:
+            return {"status": "unavailable"}
+        if not self.storage_available():
+            return {"status": "storage_unavailable"}
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT j.photo_id,p.path FROM face_jobs j JOIN photos p ON p.id=j.photo_id
+                WHERE j.status='pending' AND j.model_version=? AND j.attempts<3
+                ORDER BY j.updated_at,j.photo_id LIMIT 1
+                """,
+                (FACE_MODEL_VERSION,),
+            ).fetchone()
+            if not row:
+                return {"status": "idle"}
+            connection.execute(
+                "UPDATE face_jobs SET status='running',attempts=attempts+1,error=NULL,updated_at=? WHERE photo_id=?",
+                (now, row["photo_id"]),
+            )
+        try:
+            target = safe_join(self.root, row["path"])
+            if not target or not target.is_file():
+                raise FileNotFoundError(row["path"])
+            detected = get_engine(model_dir).analyze(target)
+            completed = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            with self.connect() as connection:
+                connection.execute("DELETE FROM faces WHERE photo_id=?", (row["photo_id"],))
+                known = connection.execute(
+                    "SELECT person_id,embedding FROM faces WHERE person_id IS NOT NULL ORDER BY id"
+                ).fetchall()
+                clusters: dict[int, list] = {}
+                for known_face in known:
+                    clusters.setdefault(known_face["person_id"], []).append(embedding_array(known_face["embedding"]))
+                centroids = {}
+                for person_id, vectors in clusters.items():
+                    centroid = vectors[0].copy()
+                    for vector in vectors[1:]:
+                        centroid += vector
+                    norm = float((centroid @ centroid) ** 0.5)
+                    if norm:
+                        centroids[person_id] = centroid / norm
+
+                used_people: set[int] = set()
+                for face in detected:
+                    vector = embedding_array(face["embedding"])
+                    candidates = [
+                        (float(vector @ centroid), person_id)
+                        for person_id, centroid in centroids.items() if person_id not in used_people
+                    ]
+                    similarity, person_id = max(candidates, default=(-1.0, None))
+                    if person_id is None or similarity < FACE_MATCH_THRESHOLD:
+                        cursor = connection.execute(
+                            "INSERT INTO people(name,created_at,updated_at) VALUES(NULL,?,?)", (completed, completed)
+                        )
+                        person_id = cursor.lastrowid
+                        centroids[person_id] = vector
+                    used_people.add(person_id)
+                    connection.execute(
+                        """
+                        INSERT INTO faces(photo_id,person_id,model_version,x,y,width,height,confidence,embedding,created_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            row["photo_id"], person_id, FACE_MODEL_VERSION, face["x"], face["y"],
+                            face["width"], face["height"], face["confidence"], face["embedding"], completed,
+                        ),
+                    )
+                connection.execute(
+                    "UPDATE face_jobs SET status='done',faces_found=?,error=NULL,updated_at=? WHERE photo_id=?",
+                    (len(detected), completed, row["photo_id"]),
+                )
+                connection.execute("DELETE FROM people WHERE NOT EXISTS(SELECT 1 FROM faces f WHERE f.person_id=people.id)")
+            return {"status": "complete", "photoId": row["photo_id"], "faces": len(detected)}
+        except Exception as error:
+            failed = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            with self.connect() as connection:
+                connection.execute(
+                    "UPDATE face_jobs SET status='failed',error=?,updated_at=? WHERE photo_id=?",
+                    (str(error)[:500], failed, row["photo_id"]),
+                )
+            print(f"Face analysis failed for {row['path']}: {error}", file=sys.stderr, flush=True)
+            return {"status": "failed", "photoId": row["photo_id"]}
+
+    def face_progress(self) -> dict:
+        with self.connect() as connection:
+            total = connection.execute("SELECT COUNT(*) FROM photos WHERE type='image'").fetchone()[0]
+            rows = connection.execute(
+                "SELECT status,COUNT(*) count FROM face_jobs WHERE model_version=? GROUP BY status",
+                (FACE_MODEL_VERSION,),
+            ).fetchall()
+            faces = connection.execute("SELECT COUNT(*) FROM faces").fetchone()[0]
+            people = connection.execute("SELECT COUNT(*) FROM people").fetchone()[0]
+        statuses = {row["status"]: row["count"] for row in rows}
+        return {
+            "total": total, "ready": statuses.get("done", 0), "pending": statuses.get("pending", 0),
+            "running": statuses.get("running", 0), "failed": statuses.get("failed", 0),
+            "faces": faces, "people": people, "modelVersion": FACE_MODEL_VERSION,
+            "available": bool(FACE_MODEL_VERSION),
+        }
+
+    def people(self, limit: int = 2000) -> list[dict]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT pe.id,pe.name,pe.created_at,pe.updated_at,COUNT(f.id) face_count,
+                    COUNT(DISTINCT f.photo_id) photo_count,
+                    (SELECT cf.id FROM faces cf JOIN photos cp ON cp.id=cf.photo_id
+                     WHERE cf.person_id=pe.id ORDER BY cf.confidence DESC,cp.taken DESC LIMIT 1) cover_face_id
+                FROM people pe JOIN faces f ON f.person_id=pe.id
+                GROUP BY pe.id ORDER BY (pe.name IS NOT NULL) DESC,face_count DESC,pe.id LIMIT ?
+                """,
+                (max(1, min(2000, limit)),),
+            ).fetchall()
+        return [{
+            "id": row["id"], "name": row["name"] or f"Человек {row['id']}",
+            "named": bool(row["name"]), "faceCount": row["face_count"], "photoCount": row["photo_count"],
+            "coverFaceId": row["cover_face_id"], "createdAt": row["created_at"], "updatedAt": row["updated_at"],
+        } for row in rows]
+
+    def person_faces(self, person_id: int, limit: int = 300) -> list[dict]:
+        with self.connect() as connection:
+            if not connection.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
+                raise KeyError("person")
+            rows = connection.execute(
+                """
+                SELECT f.id,f.photo_id,f.person_id,f.confidence,p.name,p.taken
+                FROM faces f JOIN photos p ON p.id=f.photo_id
+                WHERE f.person_id=? ORDER BY p.taken DESC,f.confidence DESC LIMIT ?
+                """,
+                (person_id, max(1, min(1000, limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def face_record(self, face_id: int) -> dict:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT f.id,f.photo_id,f.person_id,f.x,f.y,f.width,f.height,p.path,p.mtime_ns
+                FROM faces f JOIN photos p ON p.id=f.photo_id WHERE f.id=?
+                """,
+                (face_id,),
+            ).fetchone()
+        if not row:
+            raise KeyError("face")
+        return dict(row)
+
+    def rename_person(self, person_id: int, name: str) -> dict:
+        name = " ".join(name.strip().split())[:80]
+        if not name:
+            raise ValueError("Имя не может быть пустым")
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            with self.connect() as connection:
+                if not connection.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
+                    raise KeyError("person")
+                connection.execute("UPDATE people SET name=?,updated_at=? WHERE id=?", (name, now, person_id))
+        except sqlite3.IntegrityError as error:
+            raise ValueError("Человек с таким именем уже существует") from error
+        return next(person for person in self.people(2000) if person["id"] == person_id)
+
+    def merge_people(self, source_id: int, target_id: int) -> int:
+        if source_id == target_id:
+            raise ValueError("Выберите две разные группы")
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            found = connection.execute(
+                "SELECT id FROM people WHERE id IN (?,?)", (source_id, target_id)
+            ).fetchall()
+            if len(found) != 2:
+                raise KeyError("person")
+            if connection.execute(
+                """
+                SELECT 1 FROM faces source JOIN faces target ON target.photo_id=source.photo_id
+                WHERE source.person_id=? AND target.person_id=? LIMIT 1
+                """,
+                (source_id, target_id),
+            ).fetchone():
+                raise ValueError("Эти группы встречаются на одной фотографии и не могут быть одним человеком")
+            moved = connection.execute("UPDATE faces SET person_id=? WHERE person_id=?", (target_id, source_id)).rowcount
+            connection.execute("UPDATE people SET updated_at=? WHERE id=?", (now, target_id))
+            connection.execute("DELETE FROM people WHERE id=?", (source_id,))
+        return moved
+
+    def move_face(self, face_id: int, person_id: int | None) -> int:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            face = connection.execute("SELECT photo_id,person_id FROM faces WHERE id=?", (face_id,)).fetchone()
+            if not face:
+                raise KeyError("face")
+            old_person = face["person_id"]
+            if person_id is None:
+                cursor = connection.execute(
+                    "INSERT INTO people(name,created_at,updated_at) VALUES(NULL,?,?)", (now, now)
+                )
+                person_id = cursor.lastrowid
+            elif not connection.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
+                raise KeyError("person")
+            if connection.execute(
+                "SELECT 1 FROM faces WHERE photo_id=? AND person_id=? AND id!=?", (face["photo_id"], person_id, face_id)
+            ).fetchone():
+                raise ValueError("Этот человек уже отмечен на фотографии")
+            connection.execute("UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id))
+            connection.execute("UPDATE people SET updated_at=? WHERE id=?", (now, person_id))
+            connection.execute("DELETE FROM people WHERE id=? AND NOT EXISTS(SELECT 1 FROM faces WHERE person_id=?)", (old_person, old_person))
+        return person_id
+
+    def queue_face_reindex(self, failed_only: bool = False) -> int:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            if failed_only:
+                return connection.execute(
+                    "UPDATE face_jobs SET status='pending',attempts=0,error=NULL,updated_at=? WHERE status='failed'", (now,)
+                ).rowcount
+            connection.execute("DELETE FROM faces")
+            connection.execute("DELETE FROM people")
+            connection.execute("DELETE FROM face_jobs")
+            return connection.execute(
+                "INSERT INTO face_jobs(photo_id,model_version,status,attempts,updated_at) SELECT id,?,'pending',0,? FROM photos WHERE type='image'",
+                (FACE_MODEL_VERSION, now),
+            ).rowcount
+
     @staticmethod
     def _filters(query: str, kind: str, year: int | None, month: int | None, favorite: bool,
                  album: int | None, filters: dict | None = None, day: int | None = None,
-                 before_year: int | None = None, undated: bool = False, smart: str = ""):
+                 before_year: int | None = None, undated: bool = False, smart: str = "",
+                 person: int | None = None):
         clauses: list[str] = []
         values: list = []
         if query.strip():
@@ -896,6 +1197,9 @@ class GalleryDatabase:
         if album is not None:
             clauses.append("EXISTS(SELECT 1 FROM album_photos ap WHERE ap.photo_id=p.id AND ap.album_id=?)")
             values.append(album)
+        if person is not None:
+            clauses.append("EXISTS(SELECT 1 FROM faces pf WHERE pf.photo_id=p.id AND pf.person_id=?)")
+            values.append(person)
         filters = filters or {}
         if filters.get("camera"):
             clauses.append("p.camera_model=?")
@@ -922,14 +1226,15 @@ class GalleryDatabase:
               month: int | None = None, favorite: bool = False, album: int | None = None,
               filters: dict | None = None, day: int | None = None,
               before_year: int | None = None, undated: bool = False,
-              smart: str = "") -> tuple[list[dict], int]:
-        where, values = self._filters(query, kind, year, month, favorite, album, filters, day, before_year, undated, smart)
+              smart: str = "", person: int | None = None) -> tuple[list[dict], int]:
+        where, values = self._filters(query, kind, year, month, favorite, album, filters, day, before_year, undated, smart, person)
         select = """
             SELECT p.*,
                 EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
                 (SELECT GROUP_CONCAT(ap.album_id) FROM album_photos ap WHERE ap.photo_id=p.id) AS album_ids,
                 (SELECT category FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_category,
-                (SELECT tags FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_tags
+                (SELECT tags FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_tags,
+                (SELECT COUNT(*) FROM faces fa WHERE fa.photo_id=p.id) AS face_count
             FROM photos p
         """
         with self.connect() as connection:
@@ -952,6 +1257,7 @@ class GalleryDatabase:
         item["cameraModel"] = item.pop("camera_model")
         item["dateSource"] = item.pop("date_source")
         item["smartCategory"] = item.pop("smart_category", None)
+        item["faceCount"] = item.pop("face_count", 0)
         smart_tags = item.pop("smart_tags", None)
         try:
             item["smartTags"] = json.loads(smart_tags) if smart_tags else []
@@ -1124,7 +1430,8 @@ class GalleryDatabase:
                 EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
                 (SELECT GROUP_CONCAT(ap.album_id) FROM album_photos ap WHERE ap.photo_id=p.id) AS album_ids,
                 (SELECT category FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_category,
-                (SELECT tags FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_tags
+                (SELECT tags FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_tags,
+                (SELECT COUNT(*) FROM faces fa WHERE fa.photo_id=p.id) AS face_count
             FROM photos p
         """
         with self.connect() as connection:
@@ -1413,6 +1720,43 @@ class GalleryHandler(BaseHTTPRequestHandler):
                         return
         self.send_file(cached, "image/jpeg")
 
+    def face_thumbnail(self, face_id: int):
+        try:
+            face = self.app.database.face_record(face_id)
+        except KeyError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        source = safe_join(self.app.photo_root, face["path"])
+        if not source or not source.is_file() or Image is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        key = hashlib.sha1(f"face:{face_id}:{face['mtime_ns']}:{face['x']}:{face['y']}:{face['width']}:{face['height']}".encode()).hexdigest()
+        cached = self.app.cache_dir / "faces" / key[:2] / f"{key}.jpg"
+        if not cached.exists():
+            with self.app.thumbnail_slots:
+                if not cached.exists():
+                    cached.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = cached.with_name(f"{cached.name}.{threading.get_ident()}.tmp")
+                    try:
+                        with Image.open(source) as image:
+                            image = ImageOps.exif_transpose(image).convert("RGB")
+                            center_x = face["x"] + face["width"] / 2
+                            center_y = face["y"] + face["height"] / 2
+                            side = max(face["width"], face["height"]) * 1.65
+                            left = max(0, int(center_x - side / 2))
+                            top = max(0, int(center_y - side / 2))
+                            right = min(image.width, int(center_x + side / 2))
+                            bottom = min(image.height, int(center_y + side / 2))
+                            crop = image.crop((left, top, right, bottom))
+                            crop.thumbnail((320, 320), Image.Resampling.LANCZOS)
+                            crop.save(temporary, "JPEG", quality=86, optimize=True)
+                        temporary.replace(cached)
+                    except Exception:
+                        temporary.unlink(missing_ok=True)
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+        self.send_file(cached, "image/jpeg")
+
     @staticmethod
     def photo_payload(item: dict) -> dict:
         encoded = quote(item["path"], safe="/")
@@ -1427,6 +1771,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             day = int(params["day"][0]) if params.get("day") else None
             before_year = int(params["before_year"][0]) if params.get("before_year") else None
             album = int(params["album"][0]) if params.get("album") else None
+            person = int(params["person"][0]) if params.get("person") else None
             min_size = int(float(params["min_mb"][0]) * 1024 * 1024) if params.get("min_mb") else None
             max_size = int(float(params["max_mb"][0]) * 1024 * 1024) if params.get("max_mb") else None
         except ValueError:
@@ -1457,7 +1802,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             "max_size": max_size,
         }
         items, total = self.app.database.query(
-            offset, limit, query, kind, year, month, favorite, album, filters, day, before_year, undated, smart
+            offset, limit, query, kind, year, month, favorite, album, filters, day, before_year, undated, smart, person
         )
         payload = [self.photo_payload(item) for item in items]
         self.send_json({"items": payload, "total": total, "offset": offset, "hasMore": offset + len(payload) < total})
@@ -1516,6 +1861,19 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 collection["coverUrl"] = "/thumb/" + quote(cover, safe="/") if cover else None
             self.send_json(catalog)
             return
+        if path == "/api/people":
+            people = self.app.database.people()
+            for person in people:
+                person["coverUrl"] = f"/face-thumb/{person.pop('coverFaceId')}"
+            self.send_json({"people": people, "progress": self.app.database.face_progress()})
+            return
+        person_faces_match = re.fullmatch(r"/api/people/(\d+)/faces", path)
+        if person_faces_match:
+            faces = self.app.database.person_faces(int(person_faces_match.group(1)))
+            for face in faces:
+                face["thumbUrl"] = f"/face-thumb/{face['id']}"
+            self.send_json({"faces": faces})
+            return
         if path == "/api/duplicates":
             mode = params.get("mode", ["exact"])[0]
             if mode not in {"exact", "similar"}:
@@ -1556,6 +1914,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/thumb/"):
             self.thumbnail(path[len("/thumb/"):])
+            return
+        face_thumb_match = re.fullmatch(r"/face-thumb/(\d+)", path)
+        if face_thumb_match:
+            self.face_thumbnail(int(face_thumb_match.group(1)))
             return
         static_name = "index.html" if path == "/" else path.removeprefix("/static/")
         if static_name not in STATIC_FILES:
@@ -1687,6 +2049,34 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 count = self.app.database.queue_smart_reindex(bool(body.get("failedOnly", False)))
                 self.send_json({"queued": count})
                 return
+            person_match = re.fullmatch(r"/api/people/(\d+)", path)
+            if person_match:
+                if not self.require_auth("editor"):
+                    return
+                person = self.app.database.rename_person(int(person_match.group(1)), str(body.get("name", "")))
+                person["coverUrl"] = f"/face-thumb/{person.pop('coverFaceId')}"
+                self.send_json(person)
+                return
+            if path == "/api/people/merge":
+                if not self.require_auth("editor"):
+                    return
+                moved = self.app.database.merge_people(int(body.get("sourceId", 0)), int(body.get("targetId", 0)))
+                self.send_json({"moved": moved})
+                return
+            face_match = re.fullmatch(r"/api/faces/(\d+)", path)
+            if face_match:
+                if not self.require_auth("editor"):
+                    return
+                raw_person = body.get("personId")
+                person_id = self.app.database.move_face(int(face_match.group(1)), int(raw_person) if raw_person is not None else None)
+                self.send_json({"personId": person_id})
+                return
+            if path == "/api/faces/reindex":
+                if not self.require_auth("admin"):
+                    return
+                count = self.app.database.queue_face_reindex(bool(body.get("failedOnly", False)))
+                self.send_json({"queued": count})
+                return
             if path == "/api/download/zip":
                 photo_ids = body.get("photoIds", [])
                 if not isinstance(photo_ids, list) or not photo_ids or len(photo_ids) > 500:
@@ -1758,6 +2148,7 @@ def main():
     smart_delay = max(0.2, float(os.getenv("PHOTO_SMART_DELAY", "1.5")))
     smart_languages = os.getenv("PHOTO_SMART_OCR_LANGUAGES", "rus+eng")[:40]
     smart_timeout = max(5, min(120, int(os.getenv("PHOTO_SMART_OCR_TIMEOUT", "20"))))
+    face_model_dir = Path(os.getenv("PHOTO_FACE_MODELS", str(APP_DIR / "models"))).resolve()
     marker_file = os.getenv("PHOTO_MARKER_FILE", ".photodom-storage")
     database = GalleryDatabase(photo_root, Path(args.database), Path(args.backups), marker_file)
     database.bootstrap_admin(os.getenv("PHOTO_USER", "photos"), os.getenv("PHOTO_PASSWORD", ""))
@@ -1808,12 +2199,14 @@ def main():
     def analyze_smart_catalog():
         while True:
             try:
-                result = database.analyze_next(
+                smart_result = database.analyze_next(
                     ocr_enabled=smart_ocr,
                     ocr_languages=smart_languages,
                     ocr_timeout=smart_timeout,
                 )
-                time.sleep(10 if result["status"] in {"idle", "unavailable", "storage_unavailable"} else smart_delay)
+                face_result = database.analyze_faces_next(face_model_dir)
+                idle = {"idle", "unavailable", "storage_unavailable"}
+                time.sleep(10 if smart_result["status"] in idle and face_result["status"] in idle else smart_delay)
             except Exception as error:
                 print(f"Smart catalog worker failed: {error}", file=sys.stderr, flush=True)
                 time.sleep(30)

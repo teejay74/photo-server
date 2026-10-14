@@ -99,6 +99,22 @@
     </section>
   </dialog>
 
+  <dialog id="peopleDialog" class="panel-dialog people-dialog">
+    <section class="panel-shell">
+      <header class="panel-header"><div><small>ЛОКАЛЬНОЕ РАСПОЗНАВАНИЕ</small><h2>Люди</h2><p id="peopleProgress">Загружаем группы…</p></div><button data-close="peopleDialog" aria-label="Закрыть">×</button></header>
+      <div id="peopleList" class="people-list"></div>
+      <footer class="smart-footer" data-min-role="admin"><span>Лица анализируются локально, фотографии не отправляются наружу.</span><button id="facesReindex">Переиндексировать лица</button></footer>
+    </section>
+  </dialog>
+
+  <dialog id="personFacesDialog" class="panel-dialog people-dialog">
+    <section class="panel-shell">
+      <header class="panel-header"><div><small>ПРОВЕРКА ГРУППЫ</small><h2 id="personFacesTitle">Человек</h2><p>Ошибочное лицо можно перенести или отделить в новую группу.</p></div><button data-close="personFacesDialog" aria-label="Закрыть">×</button></header>
+      <div class="person-actions" data-min-role="editor"><button id="renamePerson">Переименовать</button><button id="mergePerson">Объединить группу</button></div>
+      <div id="personFacesList" class="person-faces-list"></div>
+    </section>
+  </dialog>
+
   <dialog id="albumPickerDialog" class="panel-dialog compact-dialog">
     <section class="panel-shell">
       <header class="panel-header"><div><small>ДОБАВИТЬ ФОТО</small><h2>Выберите альбом</h2></div><button data-close="albumPickerDialog" aria-label="Закрыть">×</button></header>
@@ -169,6 +185,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/static/vendor/leaflet/leaflet.js?v=1.9.4" defer></script>
-  <script src="/static/app.js?v=13" defer></script>
+  <script src="/static/app.js?v=14" defer></script>
 </body>
 </html>

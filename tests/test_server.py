@@ -1,4 +1,5 @@
 import argparse
+from array import array
 import http.client
 import json
 import tempfile
@@ -98,6 +99,38 @@ class GalleryDatabaseTests(unittest.TestCase):
         panoramas, count = self.database.query(0, 10, "", "image", smart="panoramas")
         self.assertEqual(count, 1)
         self.assertEqual(panoramas[0]["smartCategory"], "panorama")
+
+    def test_people_groups_rename_merge_and_split(self):
+        Image.new("RGB", (50, 70), "#8d735f").save(self.root / "person-two.jpg")
+        self.database.refresh()
+        photos = self.database.query(0, 10, "", "image")[0]
+        now = "2026-10-14T12:00:00+00:00"
+        embedding = array("f", [0.0] * 127 + [1.0]).tobytes()
+        with self.database.connect() as connection:
+            first_person = connection.execute(
+                "INSERT INTO people(name,created_at,updated_at) VALUES(NULL,?,?)", (now, now)
+            ).lastrowid
+            second_person = connection.execute(
+                "INSERT INTO people(name,created_at,updated_at) VALUES(NULL,?,?)", (now, now)
+            ).lastrowid
+            first_face = connection.execute(
+                "INSERT INTO faces(photo_id,person_id,model_version,x,y,width,height,confidence,embedding,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (photos[0]["id"], first_person, 1, 5, 5, 20, 20, 0.95, embedding, now),
+            ).lastrowid
+            second_face = connection.execute(
+                "INSERT INTO faces(photo_id,person_id,model_version,x,y,width,height,confidence,embedding,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (photos[1]["id"], second_person, 1, 6, 6, 21, 21, 0.94, embedding, now),
+            ).lastrowid
+
+        renamed = self.database.rename_person(first_person, "Артём")
+        self.assertEqual(renamed["name"], "Артём")
+        self.assertEqual(self.database.merge_people(second_person, first_person), 1)
+        items, total = self.database.query(0, 10, "", "image", person=first_person)
+        self.assertEqual((len(items), total), (2, 2))
+        self.assertEqual(len(self.database.person_faces(first_person)), 2)
+        new_person = self.database.move_face(second_face, None)
+        self.assertNotEqual(new_person, first_person)
+        self.assertEqual(self.database.face_record(first_face)["person_id"], first_person)
 
     def test_gps_conversion(self):
         self.assertEqual(gps_coordinate((55, 45, 0), "N"), 55.75)
@@ -226,7 +259,12 @@ class GalleryDatabaseTests(unittest.TestCase):
             status, data, _ = request("GET", "/api/smart/catalog")
             self.assertEqual(status, 200)
             self.assertIn("progress", data)
+            self.assertIn("faces", data)
+            status, data, _ = request("GET", "/api/people")
+            self.assertEqual((status, data["people"]), (200, []))
             status, data, _ = request("POST", "/api/smart/reindex", {})
+            self.assertEqual((status, data["queued"]), (200, 1))
+            status, data, _ = request("POST", "/api/faces/reindex", {})
             self.assertEqual((status, data["queued"]), (200, 1))
             status, data, _ = request("GET", "/api/duplicates?mode=exact")
             self.assertEqual((status, data["groups"]), (200, []))
