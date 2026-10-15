@@ -266,6 +266,19 @@ class GalleryDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS album_photos_photo_idx ON album_photos(photo_id);
 
+                CREATE TABLE IF NOT EXISTS photo_metadata (
+                    photo_id TEXT PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+                    title TEXT,
+                    description TEXT NOT NULL DEFAULT '',
+                    taken TEXT,
+                    latitude REAL,
+                    longitude REAL,
+                    location_overridden INTEGER NOT NULL DEFAULT 0,
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL,
+                    updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS app_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -1156,28 +1169,30 @@ class GalleryDatabase:
             needle = f"%{query.strip()}%"
             smart_needle = f"%{query.strip().casefold()}%"
             clauses.append(
-                "(p.name LIKE ? COLLATE NOCASE OR p.taken LIKE ? OR p.camera_make LIKE ? COLLATE NOCASE "
+                "(p.name LIKE ? COLLATE NOCASE OR mo.title LIKE ? COLLATE NOCASE "
+                "OR mo.description LIKE ? COLLATE NOCASE OR mo.tags LIKE ? COLLATE NOCASE "
+                "OR COALESCE(mo.taken,p.taken) LIKE ? OR p.camera_make LIKE ? COLLATE NOCASE "
                 "OR p.camera_model LIKE ? COLLATE NOCASE OR EXISTS(SELECT 1 FROM smart_analysis sa "
                 "WHERE sa.photo_id=p.id AND (sa.ocr_text LIKE ? COLLATE NOCASE OR sa.search_text LIKE ? COLLATE NOCASE)))"
             )
-            values.extend([needle, needle, needle, needle, smart_needle, smart_needle])
+            values.extend([needle, needle, needle, needle, needle, needle, needle, smart_needle, smart_needle])
         if kind != "all":
             clauses.append("p.type=?")
             values.append(kind)
         if year is not None:
-            clauses.append("p.year=?")
+            clauses.append("CAST(SUBSTR(COALESCE(mo.taken,p.taken),1,4) AS INTEGER)=?")
             values.append(year)
         if month is not None:
-            clauses.append("p.month=?")
+            clauses.append("CAST(SUBSTR(COALESCE(mo.taken,p.taken),6,2) AS INTEGER)=?")
             values.append(month)
         if day is not None:
-            clauses.append("CAST(SUBSTR(p.taken,9,2) AS INTEGER)=?")
+            clauses.append("CAST(SUBSTR(COALESCE(mo.taken,p.taken),9,2) AS INTEGER)=?")
             values.append(day)
         if before_year is not None:
-            clauses.append("p.year<=?")
+            clauses.append("CAST(SUBSTR(COALESCE(mo.taken,p.taken),1,4) AS INTEGER)<=?")
             values.append(before_year)
         if undated:
-            clauses.append("p.date_source='modified'")
+            clauses.append("p.date_source='modified' AND mo.taken IS NULL")
         smart_clause = GalleryDatabase._smart_filter_clause(smart)
         if smart_clause:
             clauses.append(smart_clause)
@@ -1206,14 +1221,20 @@ class GalleryDatabase:
             clauses.append("p.camera_model=?")
             values.append(filters["camera"])
         if filters.get("gps") == "yes":
-            clauses.append("p.latitude IS NOT NULL AND p.longitude IS NOT NULL")
+            clauses.append(
+                "(CASE WHEN COALESCE(mo.location_overridden,0)=1 THEN mo.latitude ELSE p.latitude END) IS NOT NULL "
+                "AND (CASE WHEN COALESCE(mo.location_overridden,0)=1 THEN mo.longitude ELSE p.longitude END) IS NOT NULL"
+            )
         elif filters.get("gps") == "no":
-            clauses.append("(p.latitude IS NULL OR p.longitude IS NULL)")
+            clauses.append(
+                "((CASE WHEN COALESCE(mo.location_overridden,0)=1 THEN mo.latitude ELSE p.latitude END) IS NULL "
+                "OR (CASE WHEN COALESCE(mo.location_overridden,0)=1 THEN mo.longitude ELSE p.longitude END) IS NULL)"
+            )
         if filters.get("date_from"):
-            clauses.append("p.taken>=?")
+            clauses.append("COALESCE(mo.taken,p.taken)>=?")
             values.append(filters["date_from"] + "T00:00:00")
         if filters.get("date_to"):
-            clauses.append("p.taken<=?")
+            clauses.append("COALESCE(mo.taken,p.taken)<=?")
             values.append(filters["date_to"] + "T23:59:59")
         if filters.get("min_size") is not None:
             clauses.append("p.size>=?")
@@ -1235,17 +1256,25 @@ class GalleryDatabase:
         )
         select = """
             SELECT p.*,
+                mo.title AS metadata_title, mo.description AS metadata_description,
+                mo.taken AS metadata_taken, mo.latitude AS metadata_latitude,
+                mo.longitude AS metadata_longitude,
+                COALESCE(mo.location_overridden,0) AS location_overridden,
+                mo.tags AS metadata_tags, mo.updated_at AS metadata_updated_at,
                 EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
                 (SELECT GROUP_CONCAT(ap.album_id) FROM album_photos ap WHERE ap.photo_id=p.id) AS album_ids,
                 (SELECT category FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_category,
                 (SELECT tags FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_tags,
                 (SELECT COUNT(*) FROM faces fa WHERE fa.photo_id=p.id) AS face_count
-            FROM photos p
+            FROM photos p LEFT JOIN photo_metadata mo ON mo.photo_id=p.id
         """
         with self.connect() as connection:
-            total = connection.execute("SELECT COUNT(*) FROM photos p" + where, values).fetchone()[0]
+            total = connection.execute(
+                "SELECT COUNT(*) FROM photos p LEFT JOIN photo_metadata mo ON mo.photo_id=p.id" + where, values
+            ).fetchone()[0]
             rows = connection.execute(
-                select + where + " ORDER BY (p.date_source='modified') ASC, p.taken DESC, p.name DESC LIMIT ? OFFSET ?",
+                select + where + " ORDER BY (p.date_source='modified' AND mo.taken IS NULL) ASC, "
+                "COALESCE(mo.taken,p.taken) DESC, COALESCE(NULLIF(mo.title,''),p.name) DESC LIMIT ? OFFSET ?",
                 [*values, limit, offset],
             ).fetchall()
         return [self._photo(row) for row in rows], total
@@ -1253,14 +1282,47 @@ class GalleryDatabase:
     @staticmethod
     def _photo(row: sqlite3.Row) -> dict:
         item = dict(row)
+        original_taken = item["taken"]
+        original_latitude = item["latitude"]
+        original_longitude = item["longitude"]
+        metadata_taken = item.pop("metadata_taken", None)
+        location_overridden = bool(item.pop("location_overridden", 0))
+        item["title"] = item.pop("metadata_title", None) or ""
+        item["description"] = item.pop("metadata_description", None) or ""
+        item["metadataUpdatedAt"] = item.pop("metadata_updated_at", None)
+        item["takenOverridden"] = metadata_taken is not None
+        item["locationOverridden"] = location_overridden
+        item["originalTaken"] = original_taken
+        item["originalLatitude"] = original_latitude
+        item["originalLongitude"] = original_longitude
+        if metadata_taken is not None:
+            item["taken"] = metadata_taken
+        metadata_latitude = item.pop("metadata_latitude", None)
+        metadata_longitude = item.pop("metadata_longitude", None)
+        if location_overridden:
+            item["latitude"] = metadata_latitude
+            item["longitude"] = metadata_longitude
+        metadata_tags = item.pop("metadata_tags", None)
+        try:
+            item["manualTags"] = json.loads(metadata_tags) if metadata_tags else []
+        except json.JSONDecodeError:
+            item["manualTags"] = []
+        item["metadataEdited"] = bool(
+            item["title"] or item["description"] or item["manualTags"]
+            or item["takenOverridden"] or item["locationOverridden"]
+        )
         item["favorite"] = bool(item.get("favorite"))
         album_ids = item.pop("album_ids", None)
         item["albumIds"] = [int(value) for value in album_ids.split(",")] if album_ids else []
-        item["monthNumber"] = item.pop("month")
+        item.pop("month")
+        item["year"] = int(item["taken"][:4])
+        item["monthNumber"] = int(item["taken"][5:7])
         item["month"] = item["taken"][:7]
         item["cameraMake"] = item.pop("camera_make")
         item["cameraModel"] = item.pop("camera_model")
-        item["dateSource"] = item.pop("date_source")
+        original_date_source = item.pop("date_source")
+        item["originalDateSource"] = original_date_source
+        item["dateSource"] = "manual" if item["takenOverridden"] else original_date_source
         item["smartCategory"] = item.pop("smart_category", None)
         item["faceCount"] = item.pop("face_count", 0)
         smart_tags = item.pop("smart_tags", None)
@@ -1277,7 +1339,13 @@ class GalleryDatabase:
     def timeline(self) -> list[dict]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT year, month, COUNT(*) count FROM photos WHERE date_source!='modified' GROUP BY year, month ORDER BY year DESC, month DESC"
+                """
+                SELECT CAST(SUBSTR(COALESCE(m.taken,p.taken),1,4) AS INTEGER) year,
+                       CAST(SUBSTR(COALESCE(m.taken,p.taken),6,2) AS INTEGER) month, COUNT(*) count
+                FROM photos p LEFT JOIN photo_metadata m ON m.photo_id=p.id
+                WHERE p.date_source!='modified' OR m.taken IS NOT NULL
+                GROUP BY year,month ORDER BY year DESC,month DESC
+                """
             ).fetchall()
         years: dict[int, dict] = {}
         for row in rows:
@@ -1288,12 +1356,23 @@ class GalleryDatabase:
 
     def undated_count(self) -> int:
         with self.connect() as connection:
-            return connection.execute("SELECT COUNT(*) FROM photos WHERE date_source='modified'").fetchone()[0]
+            return connection.execute(
+                "SELECT COUNT(*) FROM photos p LEFT JOIN photo_metadata m ON m.photo_id=p.id "
+                "WHERE p.date_source='modified' AND m.taken IS NULL"
+            ).fetchone()[0]
 
     def stats(self) -> dict:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT COUNT(*) total, COALESCE(SUM(type='image'),0) images, COALESCE(SUM(type='video'),0) videos, COALESCE(SUM(size),0) bytes, COALESCE(SUM(latitude IS NOT NULL AND longitude IS NOT NULL),0) located FROM photos"
+                """
+                SELECT COUNT(*) total, COALESCE(SUM(type='image'),0) images,
+                    COALESCE(SUM(type='video'),0) videos, COALESCE(SUM(size),0) bytes,
+                    COALESCE(SUM(
+                        (CASE WHEN COALESCE(m.location_overridden,0)=1 THEN m.latitude ELSE p.latitude END) IS NOT NULL
+                        AND (CASE WHEN COALESCE(m.location_overridden,0)=1 THEN m.longitude ELSE p.longitude END) IS NOT NULL
+                    ),0) located
+                FROM photos p LEFT JOIN photo_metadata m ON m.photo_id=p.id
+                """
             ).fetchone()
             updated = connection.execute("SELECT value FROM app_meta WHERE key='last_scan'").fetchone()
         return {
@@ -1306,9 +1385,96 @@ class GalleryDatabase:
     def map_items(self) -> list[dict]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT id,name,path,taken,latitude,longitude FROM photos WHERE latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY taken DESC"
+                """
+                SELECT p.id,COALESCE(NULLIF(m.title,''),p.name) name,p.path,
+                    COALESCE(m.taken,p.taken) taken,
+                    CASE WHEN COALESCE(m.location_overridden,0)=1 THEN m.latitude ELSE p.latitude END latitude,
+                    CASE WHEN COALESCE(m.location_overridden,0)=1 THEN m.longitude ELSE p.longitude END longitude
+                FROM photos p LEFT JOIN photo_metadata m ON m.photo_id=p.id
+                WHERE (CASE WHEN COALESCE(m.location_overridden,0)=1 THEN m.latitude ELSE p.latitude END) IS NOT NULL
+                  AND (CASE WHEN COALESCE(m.location_overridden,0)=1 THEN m.longitude ELSE p.longitude END) IS NOT NULL
+                ORDER BY COALESCE(m.taken,p.taken) DESC
+                """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def update_photo_metadata(self, photo_id: str, payload: dict, user_id: int | None = None) -> dict:
+        if not PHOTO_ID.fullmatch(photo_id):
+            raise KeyError("photo")
+        if payload.get("reset"):
+            with self.connect() as connection:
+                if not connection.execute("SELECT 1 FROM photos WHERE id=?", (photo_id,)).fetchone():
+                    raise KeyError("photo")
+                connection.execute("DELETE FROM photo_metadata WHERE photo_id=?", (photo_id,))
+            return self.photos_by_ids([photo_id])[0]
+
+        title = " ".join(str(payload.get("title", "")).strip().split())
+        description = str(payload.get("description", "")).strip()
+        if len(title) > 200:
+            raise ValueError("Название не должно быть длиннее 200 символов")
+        if len(description) > 4000:
+            raise ValueError("Описание не должно быть длиннее 4000 символов")
+
+        raw_tags = payload.get("tags", [])
+        if isinstance(raw_tags, str):
+            raw_tags = raw_tags.split(",")
+        if not isinstance(raw_tags, list):
+            raise ValueError("Теги должны быть списком")
+        tags, seen_tags = [], set()
+        for raw_tag in raw_tags:
+            tag = " ".join(str(raw_tag).strip().split())
+            if not tag:
+                continue
+            if len(tag) > 40:
+                raise ValueError("Каждый тег должен быть не длиннее 40 символов")
+            key = tag.casefold()
+            if key not in seen_tags:
+                seen_tags.add(key)
+                tags.append(tag)
+        if len(tags) > 30:
+            raise ValueError("Можно указать не более 30 тегов")
+
+        raw_taken = str(payload.get("taken", "")).strip()
+        taken = None
+        if raw_taken:
+            try:
+                parsed_taken = datetime.fromisoformat(raw_taken)
+            except ValueError as error:
+                raise ValueError("Некорректная дата съёмки") from error
+            if parsed_taken.year < 1900 or parsed_taken.year > 2100:
+                raise ValueError("Год съёмки должен быть между 1900 и 2100")
+            taken = parsed_taken.isoformat(timespec="seconds")
+
+        location_overridden = bool(payload.get("locationOverridden", False))
+        latitude = longitude = None
+        if location_overridden and not payload.get("removeLocation", False):
+            try:
+                latitude = float(payload.get("latitude"))
+                longitude = float(payload.get("longitude"))
+            except (TypeError, ValueError) as error:
+                raise ValueError("Укажите широту и долготу") from error
+            if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                raise ValueError("Координаты выходят за допустимый диапазон")
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            if not connection.execute("SELECT 1 FROM photos WHERE id=?", (photo_id,)).fetchone():
+                raise KeyError("photo")
+            connection.execute(
+                """
+                INSERT INTO photo_metadata(
+                    photo_id,title,description,taken,latitude,longitude,location_overridden,tags,updated_at,updated_by
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(photo_id) DO UPDATE SET
+                    title=excluded.title,description=excluded.description,taken=excluded.taken,
+                    latitude=excluded.latitude,longitude=excluded.longitude,
+                    location_overridden=excluded.location_overridden,tags=excluded.tags,
+                    updated_at=excluded.updated_at,updated_by=excluded.updated_by
+                """,
+                (photo_id, title or None, description, taken, latitude, longitude,
+                 int(location_overridden), json.dumps(tags, ensure_ascii=False), now, user_id),
+            )
+        return self.photos_by_ids([photo_id])[0]
 
     def set_favorite(self, photo_id: str, favorite: bool) -> bool:
         now = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -1432,12 +1598,17 @@ class GalleryDatabase:
         placeholders = ",".join("?" for _ in valid)
         select = """
             SELECT p.*,
+                mo.title AS metadata_title, mo.description AS metadata_description,
+                mo.taken AS metadata_taken, mo.latitude AS metadata_latitude,
+                mo.longitude AS metadata_longitude,
+                COALESCE(mo.location_overridden,0) AS location_overridden,
+                mo.tags AS metadata_tags, mo.updated_at AS metadata_updated_at,
                 EXISTS(SELECT 1 FROM favorites f WHERE f.photo_id=p.id) AS favorite,
                 (SELECT GROUP_CONCAT(ap.album_id) FROM album_photos ap WHERE ap.photo_id=p.id) AS album_ids,
                 (SELECT category FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_category,
                 (SELECT tags FROM smart_analysis sa WHERE sa.photo_id=p.id) AS smart_tags,
                 (SELECT COUNT(*) FROM faces fa WHERE fa.photo_id=p.id) AS face_count
-            FROM photos p
+            FROM photos p LEFT JOIN photo_metadata mo ON mo.photo_id=p.id
         """
         with self.connect() as connection:
             rows = connection.execute(f"{select} WHERE p.id IN ({placeholders})", valid).fetchall()
@@ -2009,6 +2180,16 @@ class GalleryHandler(BaseHTTPRequestHandler):
                     password,
                 )
                 self.send_json(user)
+                return
+            metadata_match = re.fullmatch(r"/api/photos/([0-9a-f]{16})/metadata", path)
+            if metadata_match:
+                if not self.require_auth("editor"):
+                    return
+                user = self.authenticated()
+                item = self.app.database.update_photo_metadata(
+                    metadata_match.group(1), body, user["id"]
+                )
+                self.send_json(self.photo_payload(item))
                 return
             favorite_match = re.fullmatch(r"/api/favorites/([0-9a-f]{16})", path)
             album_photo_match = re.fullmatch(r"/api/albums/(\d+)/photos/([0-9a-f]{16})", path)

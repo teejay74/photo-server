@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d0e10">
   <title>ФотоДом</title>
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css?v=1.9.4">
-  <link rel="stylesheet" href="/static/styles.css?v=16">
+  <link rel="stylesheet" href="/static/styles.css?v=17">
 </head>
 <body>
   <header class="topbar">
@@ -68,6 +68,7 @@
     <div class="viewer-bar">
       <div><strong id="viewerName"></strong><small id="viewerMeta"></small></div>
       <div class="viewer-actions">
+        <button id="editMetadata" data-min-role="editor" aria-label="Изменить сведения" title="Изменить сведения">✎</button>
         <button id="albumCurrent" data-min-role="editor" aria-label="Добавить в альбом" title="Добавить в альбом">＋</button>
         <button id="favoriteCurrent" data-min-role="editor" aria-label="Добавить в избранное">♡</button>
         <a id="downloadCurrent" aria-label="Скачать" title="Скачать">↓</a>
@@ -76,7 +77,24 @@
     </div>
     <button class="nav prev" id="prevItem" aria-label="Предыдущий">‹</button>
     <div id="viewerStage" class="viewer-stage"></div>
+    <div id="viewerDetails" class="viewer-details" hidden></div>
     <button class="nav next" id="nextItem" aria-label="Следующий">›</button>
+  </dialog>
+
+  <dialog id="metadataDialog" class="panel-dialog compact-dialog">
+    <section class="panel-shell">
+      <header class="panel-header"><div><small>БЕЗ ИЗМЕНЕНИЯ ОРИГИНАЛА</small><h2>Сведения о файле</h2><p id="metadataFileName"></p></div><button data-close="metadataDialog" aria-label="Закрыть">×</button></header>
+      <form id="metadataForm" class="metadata-form">
+        <label class="wide">Название<input id="metadataTitle" maxlength="200" placeholder="Использовать имя файла"></label>
+        <label class="wide">Описание<textarea id="metadataDescription" maxlength="4000" rows="4" placeholder="Что происходит на снимке"></textarea></label>
+        <label class="wide">Дата и время съёмки<input id="metadataTaken" type="datetime-local"><small id="metadataOriginalTaken"></small></label>
+        <label class="wide">Теги<input id="metadataTags" placeholder="семья, отпуск, Урал"><small>Разделяйте теги запятыми</small></label>
+        <label class="wide">Геопозиция<select id="metadataLocationMode"><option value="inherit">Из файла</option><option value="custom">Указать вручную</option><option value="remove">Скрыть геопозицию</option></select></label>
+        <label>Широта<input id="metadataLatitude" type="number" min="-90" max="90" step="any" placeholder="56.8389"></label>
+        <label>Долгота<input id="metadataLongitude" type="number" min="-180" max="180" step="any" placeholder="60.6057"></label>
+        <div class="form-actions wide"><button type="button" id="resetMetadata">Вернуть данные из файла</button><button type="submit">Сохранить</button></div>
+      </form>
+    </section>
   </dialog>
 
   <dialog id="albumsDialog" class="panel-dialog">
@@ -193,6 +211,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/static/vendor/leaflet/leaflet.js?v=1.9.4" defer></script>
-  <script src="/static/app.js?v=16" defer></script>
+  <script src="/static/app.js?v=17" defer></script>
 </body>
 </html>

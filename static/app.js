@@ -97,10 +97,10 @@ function render(from=0){
     }
     const tile=document.createElement('figure'); tile.className='tile'+(state.selected.has(item.id)?' selected':''); tile.dataset.id=item.id;
     const visual=item.type==='image'
-      ? `<img loading="lazy" src="${item.thumbUrl}" alt="${escapeHtml(item.name)}">`
+      ? `<img loading="lazy" src="${item.thumbUrl}" alt="${escapeHtml(item.title||item.name)}">`
       : `<video muted preload="metadata" src="${item.mediaUrl}#t=0.1"></video><span class="video-badge">▶</span>`;
     const dateBadge=isUndated?'<span class="tile-date">Без даты</span>':`<time class="tile-date" datetime="${item.taken}">${tileDate.format(new Date(item.taken))}</time>`;
-    tile.innerHTML=`${visual}<span class="selection-check">${state.selected.has(item.id)?'✓':''}</span>${item.favorite?'<span class="favorite-badge">♥</span>':''}${dateBadge}<figcaption class="tile-overlay"><span class="tile-name">${escapeHtml(item.name)}</span><span>${size(item.size)}</span></figcaption>`;
+    tile.innerHTML=`${visual}<span class="selection-check">${state.selected.has(item.id)?'✓':''}</span>${item.favorite?'<span class="favorite-badge">♥</span>':''}${dateBadge}<figcaption class="tile-overlay"><span class="tile-name">${escapeHtml(item.title||item.name)}</span><span>${size(item.size)}</span></figcaption>`;
     tile.addEventListener('click',()=>state.selecting?toggleSelection(item.id):openViewer(state.items.findIndex(value=>value.id===item.id)));
     const image=tile.querySelector('img');
     if(image){ if(image.complete) image.classList.add('loaded'); else image.addEventListener('load',event=>event.currentTarget.classList.add('loaded'),{once:true}); }
@@ -192,21 +192,80 @@ async function downloadSelection(){
 function openViewer(index){
   if(index<0||index>=state.items.length) return;
   state.current=index; const item=state.items[index];
-  document.querySelector('#viewerName').textContent=item.name;
+  document.querySelector('#viewerName').textContent=item.title||item.name;
   const metadata=[item.dateSource==='modified'?'Дата съёмки неизвестна':fullDate.format(new Date(item.taken)),size(item.size)];
   if(item.width&&item.height) metadata.push(`${item.width}×${item.height}`);
   if(item.cameraModel) metadata.push(item.cameraModel);
   if(item.latitude!=null) metadata.push('есть геопозиция');
   if(item.faceCount) metadata.push(`лиц: ${item.faceCount}`);
+  if(item.metadataEdited) metadata.push('исправлено вручную');
   document.querySelector('#viewerMeta').textContent=metadata.join(' · ');
+  const details=document.querySelector('#viewerDetails');
+  details.textContent=[item.description,item.manualTags?.length?item.manualTags.map(tag=>`#${tag}`).join(' · '):''].filter(Boolean).join('\n');
+  details.hidden=!details.textContent;
   document.querySelector('#downloadCurrent').href='/download/'+item.path.split('/').map(encodeURIComponent).join('/');
   document.querySelector('#favoriteCurrent').textContent=item.favorite?'♥':'♡';
   document.querySelector('#albumCurrent').classList.toggle('active',item.albumIds.length>0);
   stopViewerMedia();
   document.querySelector('#viewerStage').innerHTML=item.type==='image'
-    ? `<img src="${item.mediaUrl}" alt="${escapeHtml(item.name)}">`
+    ? `<img src="${item.mediaUrl}" alt="${escapeHtml(item.title||item.name)}">`
     : `<video src="${item.mediaUrl}" controls autoplay playsinline></video>`;
   if(!viewer.open) viewer.showModal();
+}
+
+function updateMetadataLocationFields(){
+  const custom=document.querySelector('#metadataLocationMode').value==='custom';
+  document.querySelector('#metadataLatitude').disabled=!custom;
+  document.querySelector('#metadataLongitude').disabled=!custom;
+}
+
+function openMetadataEditor(){
+  const item=state.items[state.current]; if(!item||!can('editor')) return;
+  document.querySelector('#metadataFileName').textContent=item.name;
+  document.querySelector('#metadataTitle').value=item.title||'';
+  document.querySelector('#metadataDescription').value=item.description||'';
+  document.querySelector('#metadataTaken').value=item.takenOverridden?item.taken.slice(0,16):'';
+  document.querySelector('#metadataOriginalTaken').textContent=item.originalDateSource==='modified'
+    ? 'В файле нет достоверной даты съёмки'
+    : `В файле: ${fullDate.format(new Date(item.originalTaken))}`;
+  document.querySelector('#metadataTags').value=(item.manualTags||[]).join(', ');
+  const locationMode=item.locationOverridden?(item.latitude==null?'remove':'custom'):'inherit';
+  document.querySelector('#metadataLocationMode').value=locationMode;
+  document.querySelector('#metadataLatitude').value=item.latitude??item.originalLatitude??'';
+  document.querySelector('#metadataLongitude').value=item.longitude??item.originalLongitude??'';
+  updateMetadataLocationFields();
+  const dialog=document.querySelector('#metadataDialog'); if(!dialog.open) dialog.showModal();
+}
+
+async function saveMetadata(event){
+  event.preventDefault(); const item=state.items[state.current]; if(!item) return;
+  const mode=document.querySelector('#metadataLocationMode').value;
+  const payload={
+    title:document.querySelector('#metadataTitle').value,
+    description:document.querySelector('#metadataDescription').value,
+    taken:document.querySelector('#metadataTaken').value,
+    tags:document.querySelector('#metadataTags').value.split(',').map(value=>value.trim()).filter(Boolean),
+    locationOverridden:mode!=='inherit', removeLocation:mode==='remove',
+    latitude:document.querySelector('#metadataLatitude').value,
+    longitude:document.querySelector('#metadataLongitude').value
+  };
+  try{
+    const updated=await api(`/api/photos/${item.id}/metadata`,{method:'POST',body:JSON.stringify(payload)});
+    state.items[state.current]=updated; document.querySelector('#metadataDialog').close(); openViewer(state.current); render();
+    const timeline=await api('/api/timeline'); state.timeline=timeline.years; state.undatedCount=timeline.undated||0; renderTimeline();
+    toast('Сведения сохранены');
+  }catch(error){ toast(error.message); }
+}
+
+async function resetMetadata(){
+  const item=state.items[state.current];
+  if(!item||!confirm('Удалить все ручные правки и вернуть сведения из файла?')) return;
+  try{
+    const updated=await api(`/api/photos/${item.id}/metadata`,{method:'POST',body:JSON.stringify({reset:true})});
+    state.items[state.current]=updated; document.querySelector('#metadataDialog').close(); openViewer(state.current); render();
+    const timeline=await api('/api/timeline'); state.timeline=timeline.years; state.undatedCount=timeline.undated||0; renderTimeline();
+    toast('Восстановлены данные из файла');
+  }catch(error){ toast(error.message); }
 }
 
 function stopViewerMedia(){
@@ -561,6 +620,10 @@ document.querySelector('#timelineUndated').addEventListener('click',selectUndate
 document.querySelector('#periodChip').addEventListener('click',clearPeriod);
 document.querySelector('#collectionChip').addEventListener('click',clearCollection);
 document.querySelector('#closeViewer').addEventListener('click',closeViewer);
+document.querySelector('#editMetadata').addEventListener('click',openMetadataEditor);
+document.querySelector('#metadataForm').addEventListener('submit',saveMetadata);
+document.querySelector('#resetMetadata').addEventListener('click',resetMetadata);
+document.querySelector('#metadataLocationMode').addEventListener('change',updateMetadataLocationFields);
 document.querySelector('#prevItem').addEventListener('click',()=>move(-1));
 document.querySelector('#nextItem').addEventListener('click',()=>move(1));
 document.querySelector('#favoriteCurrent').addEventListener('click',toggleFavorite);
@@ -570,8 +633,9 @@ document.querySelector('#smartDialog').addEventListener('close',()=>clearTimeout
 
 document.addEventListener('keydown',event=>{
   if(event.key==='Escape'&&document.querySelector('#searchWrap').classList.contains('open')&&!viewer.open) document.querySelector('#searchWrap').classList.remove('open');
-  if(viewer.open&&event.key==='ArrowLeft') move(-1);
-  if(viewer.open&&event.key==='ArrowRight') move(1);
+  const panelOpen=document.querySelector('.panel-dialog[open]');
+  if(viewer.open&&!panelOpen&&event.key==='ArrowLeft') move(-1);
+  if(viewer.open&&!panelOpen&&event.key==='ArrowRight') move(1);
 });
 [viewer,...document.querySelectorAll('.panel-dialog')].forEach(dialog=>dialog.addEventListener('click',event=>{ if(event.target===dialog) dialog.close(); }));
 viewer.addEventListener('close',stopViewerMedia);

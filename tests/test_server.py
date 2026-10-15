@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from urllib.parse import quote
 
 from PIL import Image
 
@@ -59,6 +60,40 @@ class GalleryDatabaseTests(unittest.TestCase):
         video = next(item for item in self.database.query(0, 10, "", "video")[0])
         self.assertEqual(self.database.set_favorites([photo["id"], video["id"]], True), 2)
         self.assertEqual(self.database.set_album_photos(album["id"], [photo["id"], video["id"]], True), 2)
+
+    def test_metadata_overrides_search_timeline_location_and_reset(self):
+        photo = self.database.query(0, 10, "", "image")[0][0]
+        updated = self.database.update_photo_metadata(photo["id"], {
+            "title": "Поездка на Урал",
+            "description": "Вечер у озера",
+            "taken": "2025-02-03T18:45",
+            "tags": ["семья", "Отпуск", "семья"],
+            "locationOverridden": True,
+            "latitude": 56.8389,
+            "longitude": 60.6057,
+        })
+        self.assertEqual(updated["title"], "Поездка на Урал")
+        self.assertEqual(updated["taken"], "2025-02-03T18:45:00")
+        self.assertEqual(updated["dateSource"], "manual")
+        self.assertEqual(updated["manualTags"], ["семья", "Отпуск"])
+        self.assertEqual((updated["latitude"], updated["longitude"]), (56.8389, 60.6057))
+        self.assertTrue(updated["metadataEdited"])
+
+        matches, total = self.database.query(0, 10, "озера", "image")
+        self.assertEqual((total, matches[0]["id"]), (1, photo["id"]))
+        self.assertEqual(self.database.timeline()[0]["year"], 2025)
+        self.assertEqual(self.database.map_items()[0]["name"], "Поездка на Урал")
+        self.assertEqual(self.database.refresh()["updated"], 0)
+        self.assertEqual(self.database.photos_by_ids([photo["id"]])[0]["title"], "Поездка на Урал")
+
+        removed = self.database.update_photo_metadata(photo["id"], {
+            "locationOverridden": True, "removeLocation": True,
+        })
+        self.assertIsNone(removed["latitude"])
+        self.assertEqual(self.database.map_items(), [])
+        restored = self.database.update_photo_metadata(photo["id"], {"reset": True})
+        self.assertFalse(restored["metadataEdited"])
+        self.assertEqual(restored["taken"], "2022-07-08T09:10:11")
 
     def test_filters_duplicates_and_backup(self):
         items, total = self.database.query(0, 10, "", "image", filters={"camera": "Test Camera", "gps": "no"})
@@ -249,6 +284,14 @@ class GalleryDatabaseTests(unittest.TestCase):
             status, data, _ = request("GET", "/api/photos?limit=10&type=image")
             self.assertEqual(status, 200)
             photo_id = data["items"][0]["id"]
+            status, data, _ = request("POST", f"/api/photos/{photo_id}/metadata", {
+                "title": "Исправленное название", "description": "Описание",
+                "taken": "2023-04-05T06:07", "tags": ["важное"],
+                "locationOverridden": True, "removeLocation": True,
+            })
+            self.assertEqual((status, data["title"], data["dateSource"]), (200, "Исправленное название", "manual"))
+            status, data, _ = request("GET", "/api/photos?q=" + quote("важное"))
+            self.assertEqual((status, data["total"]), (200, 1))
             status, data, _ = request("GET", "/api/photos?people_mode=invalid")
             self.assertEqual((status, data["error"]), (400, "Некорректный режим поиска людей"))
             status, data, _ = request("GET", "/api/timeline")
@@ -295,6 +338,8 @@ class GalleryDatabaseTests(unittest.TestCase):
             status, viewer_data, viewer_headers = request("POST", "/api/auth/login", {"username": "guest", "password": "viewer-password"}, authenticated=False)
             viewer_cookie = viewer_headers["Set-Cookie"].split(";", 1)[0]
             status, _, _ = request("POST", f"/api/favorites/{photo_id}", {"favorite": False}, cookie_override=viewer_cookie, csrf_override=viewer_data["csrf"])
+            self.assertEqual(status, 403)
+            status, _, _ = request("POST", f"/api/photos/{photo_id}/metadata", {"title": "Нельзя"}, cookie_override=viewer_cookie, csrf_override=viewer_data["csrf"])
             self.assertEqual(status, 403)
         finally:
             server.shutdown()
