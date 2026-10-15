@@ -1105,14 +1105,6 @@ class GalleryDatabase:
             ).fetchall()
             if len(found) != 2:
                 raise KeyError("person")
-            if connection.execute(
-                """
-                SELECT 1 FROM faces source JOIN faces target ON target.photo_id=source.photo_id
-                WHERE source.person_id=? AND target.person_id=? LIMIT 1
-                """,
-                (source_id, target_id),
-            ).fetchone():
-                raise ValueError("Эти группы встречаются на одной фотографии и не могут быть одним человеком")
             moved = connection.execute("UPDATE faces SET person_id=? WHERE person_id=?", (target_id, source_id)).rowcount
             connection.execute("UPDATE people SET updated_at=? WHERE id=?", (now, target_id))
             connection.execute("DELETE FROM people WHERE id=?", (source_id,))
@@ -1132,10 +1124,6 @@ class GalleryDatabase:
                 person_id = cursor.lastrowid
             elif not connection.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
                 raise KeyError("person")
-            if connection.execute(
-                "SELECT 1 FROM faces WHERE photo_id=? AND person_id=? AND id!=?", (face["photo_id"], person_id, face_id)
-            ).fetchone():
-                raise ValueError("Этот человек уже отмечен на фотографии")
             connection.execute("UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id))
             connection.execute("UPDATE people SET updated_at=? WHERE id=?", (now, person_id))
             connection.execute("DELETE FROM people WHERE id=? AND NOT EXISTS(SELECT 1 FROM faces WHERE person_id=?)", (old_person, old_person))

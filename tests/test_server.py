@@ -134,18 +134,18 @@ class GalleryDatabaseTests(unittest.TestCase):
             0, 10, "", "image", people=[first_person, second_person], people_mode="any"
         )
         self.assertEqual((len(either), total), (2, 2))
-        with self.database.connect() as connection:
-            connection.execute("DELETE FROM faces WHERE id=?", (shared_face,))
-
         renamed = self.database.rename_person(first_person, "Артём")
         self.assertEqual(renamed["name"], "Артём")
-        self.assertEqual(self.database.merge_people(second_person, first_person), 1)
+        self.assertEqual(self.database.merge_people(second_person, first_person), 2)
         items, total = self.database.query(0, 10, "", "image", person=first_person)
         self.assertEqual((len(items), total), (2, 2))
-        self.assertEqual(len(self.database.person_faces(first_person)), 2)
-        new_person = self.database.move_face(second_face, None)
+        self.assertEqual(len(self.database.person_faces(first_person)), 3)
+        new_person = self.database.move_face(shared_face, None)
         self.assertNotEqual(new_person, first_person)
-        self.assertEqual(self.database.face_record(first_face)["person_id"], first_person)
+        self.assertEqual(self.database.move_face(first_face, new_person), new_person)
+        self.assertEqual(self.database.face_record(first_face)["person_id"], new_person)
+        self.assertEqual(self.database.face_record(shared_face)["person_id"], new_person)
+        self.assertEqual(self.database.face_record(second_face)["person_id"], first_person)
 
     def test_gps_conversion(self):
         self.assertEqual(gps_coordinate((55, 45, 0), "N"), 55.75)
