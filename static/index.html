@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d0e10">
   <title>ФотоДом</title>
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css?v=1.9.4">
-  <link rel="stylesheet" href="/static/styles.css?v=18">
+  <link rel="stylesheet" href="/static/styles.css?v=19">
 </head>
 <body>
   <header class="topbar">
@@ -77,7 +77,10 @@
     </div>
     <button class="nav prev" id="prevItem" aria-label="Предыдущий">‹</button>
     <div id="viewerStage" class="viewer-stage"></div>
-    <div id="viewerDetails" class="viewer-details" hidden></div>
+    <div class="viewer-footer">
+      <section id="viewerPeople" class="viewer-people" aria-label="Люди на фотографии" hidden></section>
+      <div id="viewerDetails" class="viewer-details" hidden></div>
+    </div>
     <button class="nav next" id="nextItem" aria-label="Следующий">›</button>
   </dialog>
 
@@ -211,6 +214,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/static/vendor/leaflet/leaflet.js?v=1.9.4" defer></script>
-  <script src="/static/app.js?v=18" defer></script>
+  <script src="/static/app.js?v=19" defer></script>
 </body>
 </html>

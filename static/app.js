@@ -36,6 +36,11 @@ function peopleFilterLabel(){
   if(state.personNames.length<=3) return state.personNames.join(separator);
   return `${state.personNames.slice(0,2).join(separator)} · ещё ${state.personNames.length-2}`;
 }
+function showPersonPhotos(person){
+  state.personIds=[person.id]; state.personNames=[person.name]; state.personMode='all';
+  state.smartFilter=''; state.smartName=''; state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false;
+  state.year=null; state.month=null; state.undated=false; closeViewer(); renderTimeline(); renderCollectionState(); load(true);
+}
 function applyPermissions(){
   document.querySelectorAll('[data-min-role]').forEach(element=>element.hidden=!can(element.dataset.minRole));
   const button=document.querySelector('#accountButton'); button.textContent=(state.user?.username||'?').slice(0,1).toUpperCase(); button.title=state.user?.username||'Аккаунт';
@@ -193,6 +198,26 @@ async function downloadSelection(){
   }catch(error){ toast(error.message); }
 }
 
+async function loadViewerPeople(item){
+  const root=document.querySelector('#viewerPeople'); root.hidden=true; root.replaceChildren();
+  if(item.type!=='image'||!item.faceCount) return;
+  try{
+    const data=await api(`/api/photos/${item.id}/people`);
+    if(state.items[state.current]?.id!==item.id||!data.people?.length) return;
+    const label=document.createElement('span'); label.className='viewer-people-label'; label.textContent='Люди'; root.append(label);
+    for(const person of data.people){
+      const button=document.createElement('button'); button.type='button'; button.className='viewer-person';
+      button.title=`Показать все фотографии: ${person.name}`;
+      const avatar=document.createElement('img'); avatar.src=person.avatarUrl; avatar.alt=''; avatar.loading='lazy';
+      const name=document.createElement('span'); name.textContent=person.name;
+      button.append(avatar,name); button.addEventListener('click',()=>showPersonPhotos(person)); root.append(button);
+    }
+    root.hidden=false;
+  }catch(error){
+    if(state.items[state.current]?.id===item.id) root.hidden=true;
+  }
+}
+
 function openViewer(index){
   if(index<0||index>=state.items.length) return;
   state.current=index; const item=state.items[index];
@@ -216,6 +241,7 @@ function openViewer(index){
   document.querySelector('#viewerStage').innerHTML=item.type==='image'
     ? `<img src="${item.mediaUrl}" alt="${escapeHtml(item.title||item.name)}">`
     : `<video src="${item.mediaUrl}" poster="${item.thumbUrl}" controls autoplay playsinline preload="metadata"></video>`;
+  loadViewerPeople(item);
   if(item.type==='video'&&!item.videoCompatible) toast('При необходимости готовим совместимую копию видео…');
   if(!viewer.open) viewer.showModal();
 }

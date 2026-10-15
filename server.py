@@ -1183,6 +1183,33 @@ class GalleryDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def photo_people(self, photo_id: str) -> list[dict]:
+        if not PHOTO_ID.fullmatch(photo_id):
+            raise KeyError("photo")
+        with self.connect() as connection:
+            if not connection.execute("SELECT 1 FROM photos WHERE id=?", (photo_id,)).fetchone():
+                raise KeyError("photo")
+            rows = connection.execute(
+                """
+                SELECT f.id AS face_id,f.person_id,f.confidence,pe.name
+                FROM faces f JOIN people pe ON pe.id=f.person_id
+                WHERE f.photo_id=?
+                ORDER BY f.confidence DESC,f.id
+                """,
+                (photo_id,),
+            ).fetchall()
+        people = []
+        seen: set[int] = set()
+        for row in rows:
+            if row["person_id"] in seen:
+                continue
+            seen.add(row["person_id"])
+            people.append({
+                "id": row["person_id"], "name": row["name"] or f"Человек {row['person_id']}",
+                "named": bool(row["name"]), "faceId": row["face_id"],
+            })
+        return people
+
     def face_record(self, face_id: int) -> dict:
         with self.connect() as connection:
             row = connection.execute(
@@ -2247,6 +2274,20 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/photos":
             self.api_photos(params)
+            return
+        photo_people_match = re.fullmatch(r"/api/photos/([0-9a-f]{16})/people", path)
+        if photo_people_match:
+            try:
+                people = self.app.database.photo_people(photo_people_match.group(1))
+            except KeyError:
+                self.send_json({"error": "Фотография не найдена"}, HTTPStatus.NOT_FOUND)
+                return
+            self.send_json({
+                "people": [
+                    {**person, "avatarUrl": f"/face-thumb/{person['faceId']}"}
+                    for person in people
+                ]
+            })
             return
         if path == "/api/timeline":
             self.send_json({"years": self.app.database.timeline(), "undated": self.app.database.undated_count()})

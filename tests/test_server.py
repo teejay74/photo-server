@@ -236,6 +236,10 @@ class GalleryDatabaseTests(unittest.TestCase):
                 (photos[0]["id"], second_person, 1, 30, 5, 18, 18, 0.93, embedding, now),
             ).lastrowid
 
+        marked = self.database.photo_people(photos[0]["id"])
+        self.assertEqual({person["id"] for person in marked}, {first_person, second_person})
+        self.assertEqual({person["faceId"] for person in marked}, {first_face, shared_face})
+
         together, total = self.database.query(
             0, 10, "", "image", people=[first_person, second_person], people_mode="all"
         )
@@ -246,6 +250,10 @@ class GalleryDatabaseTests(unittest.TestCase):
         self.assertEqual((len(either), total), (2, 2))
         renamed = self.database.rename_person(first_person, "Артём")
         self.assertEqual(renamed["name"], "Артём")
+        self.assertEqual(
+            next(person["name"] for person in self.database.photo_people(photos[0]["id"]) if person["id"] == first_person),
+            "Артём",
+        )
         self.assertEqual(self.database.merge_people(second_person, first_person), 2)
         items, total = self.database.query(0, 10, "", "image", person=first_person)
         self.assertEqual((len(items), total), (2, 2))
@@ -359,6 +367,20 @@ class GalleryDatabaseTests(unittest.TestCase):
             status, data, _ = request("GET", "/api/photos?limit=10&type=image")
             self.assertEqual(status, 200)
             photo_id = data["items"][0]["id"]
+            now = "2026-10-15T12:00:00+00:00"
+            with self.database.connect() as connection:
+                person_id = connection.execute(
+                    "INSERT INTO people(name,created_at,updated_at) VALUES(?,?,?)", ("Артём", now, now)
+                ).lastrowid
+                face_id = connection.execute(
+                    "INSERT INTO faces(photo_id,person_id,model_version,x,y,width,height,confidence,embedding,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (photo_id, person_id, 1, 10, 10, 20, 20, 0.97, b"embedding", now),
+                ).lastrowid
+            status, data, _ = request("GET", f"/api/photos/{photo_id}/people")
+            self.assertEqual((status, data["people"][0]["name"]), (200, "Артём"))
+            self.assertEqual(data["people"][0]["avatarUrl"], f"/face-thumb/{face_id}")
+            status, _, headers = request("GET", f"/face-thumb/{face_id}")
+            self.assertEqual((status, headers["Content-Type"]), (200, "image/jpeg"))
             status, data, _ = request("POST", f"/api/photos/{photo_id}/metadata", {
                 "title": "Исправленное название", "description": "Описание",
                 "taken": "2023-04-05T06:07", "tags": ["важное"],
@@ -396,7 +418,7 @@ class GalleryDatabaseTests(unittest.TestCase):
             self.assertIn("progress", data)
             self.assertIn("faces", data)
             status, data, _ = request("GET", "/api/people")
-            self.assertEqual((status, data["people"]), (200, []))
+            self.assertEqual((status, data["people"][0]["name"]), (200, "Артём"))
             status, data, _ = request("POST", "/api/smart/reindex", {})
             self.assertEqual((status, data["queued"]), (200, 1))
             status, data, _ = request("POST", "/api/faces/reindex", {})
