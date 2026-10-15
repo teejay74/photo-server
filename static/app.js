@@ -21,6 +21,11 @@ const duration = seconds => {
   const value=Math.max(0,Math.round(Number(seconds)||0)); const hours=Math.floor(value/3600); const minutes=Math.floor(value%3600/60); const rest=value%60;
   return hours?`${hours}:${String(minutes).padStart(2,'0')}:${String(rest).padStart(2,'0')}`:`${minutes}:${String(rest).padStart(2,'0')}`;
 };
+const viewerGesture = {
+  scale:1, x:0, y:0, mode:'', startX:0, startY:0, baseX:0, baseY:0,
+  startDistance:0, startScale:1, startMidX:0, startMidY:0,
+  deltaX:0, deltaY:0, moved:false, lastTapAt:0, lastTapX:0, lastTapY:0
+};
 
 function debounce(fn, wait=300){ let timer; return (...args) => { clearTimeout(timer); timer=setTimeout(()=>fn(...args),wait); }; }
 function escapeHtml(value){ const div=document.createElement('div'); div.textContent=value??''; return div.innerHTML; }
@@ -218,6 +223,104 @@ async function loadViewerPeople(item){
   }
 }
 
+function viewerImage(){ return document.querySelector('#viewerStage img'); }
+function touchDistance(first,second){ return Math.hypot(second.clientX-first.clientX,second.clientY-first.clientY); }
+function touchMidpoint(first,second){ return {x:(first.clientX+second.clientX)/2,y:(first.clientY+second.clientY)/2}; }
+function clampViewerPosition(){
+  const image=viewerImage(); if(!image) return;
+  if(viewerGesture.scale<=1){ viewerGesture.scale=1; viewerGesture.x=0; viewerGesture.y=0; return; }
+  const boxWidth=image.clientWidth; const boxHeight=image.clientHeight;
+  const naturalWidth=image.naturalWidth||boxWidth; const naturalHeight=image.naturalHeight||boxHeight;
+  const fit=Math.min(boxWidth/naturalWidth,boxHeight/naturalHeight);
+  const displayedWidth=naturalWidth*fit; const displayedHeight=naturalHeight*fit;
+  const maxX=Math.max(0,(displayedWidth*viewerGesture.scale-boxWidth)/2);
+  const maxY=Math.max(0,(displayedHeight*viewerGesture.scale-boxHeight)/2);
+  viewerGesture.x=Math.max(-maxX,Math.min(maxX,viewerGesture.x));
+  viewerGesture.y=Math.max(-maxY,Math.min(maxY,viewerGesture.y));
+}
+function applyViewerTransform(animated=false,clamp=true){
+  const image=viewerImage(); if(!image) return;
+  if(clamp) clampViewerPosition();
+  image.style.transition=animated?'transform .22s ease-out':'none';
+  image.style.transform=`translate3d(${viewerGesture.x}px,${viewerGesture.y}px,0) scale(${viewerGesture.scale})`;
+}
+function resetViewerTransform(){
+  Object.assign(viewerGesture,{scale:1,x:0,y:0,mode:'',deltaX:0,deltaY:0,moved:false});
+  applyViewerTransform(false);
+}
+function beginViewerTouch(touch,suppressTap=false){
+  viewerGesture.mode=viewerGesture.scale>1?'pan':'swipe';
+  viewerGesture.startX=touch.clientX; viewerGesture.startY=touch.clientY;
+  viewerGesture.baseX=viewerGesture.x; viewerGesture.baseY=viewerGesture.y;
+  viewerGesture.deltaX=0; viewerGesture.deltaY=0; viewerGesture.moved=suppressTap;
+}
+function beginViewerPinch(first,second){
+  const midpoint=touchMidpoint(first,second);
+  viewerGesture.mode='pinch'; viewerGesture.startDistance=Math.max(1,touchDistance(first,second));
+  viewerGesture.startScale=viewerGesture.scale; viewerGesture.baseX=viewerGesture.x; viewerGesture.baseY=viewerGesture.y;
+  viewerGesture.startMidX=midpoint.x; viewerGesture.startMidY=midpoint.y; viewerGesture.moved=true;
+}
+function zoomViewerAt(clientX,clientY){
+  const image=viewerImage(); if(!image) return;
+  if(viewerGesture.scale>1){ viewerGesture.scale=1; viewerGesture.x=0; viewerGesture.y=0; }
+  else{
+    const bounds=image.getBoundingClientRect(); viewerGesture.scale=2.5;
+    viewerGesture.x=-(clientX-(bounds.left+bounds.width/2))*(viewerGesture.scale-1);
+    viewerGesture.y=-(clientY-(bounds.top+bounds.height/2))*(viewerGesture.scale-1);
+  }
+  applyViewerTransform(true);
+}
+function registerViewerTap(touch){
+  const now=Date.now();
+  if(now-viewerGesture.lastTapAt<300&&Math.hypot(touch.clientX-viewerGesture.lastTapX,touch.clientY-viewerGesture.lastTapY)<35){
+    viewerGesture.lastTapAt=0; zoomViewerAt(touch.clientX,touch.clientY); return;
+  }
+  viewerGesture.lastTapAt=now; viewerGesture.lastTapX=touch.clientX; viewerGesture.lastTapY=touch.clientY;
+}
+function handleViewerTouchStart(event){
+  if(!viewerImage()) return;
+  event.preventDefault();
+  if(event.touches.length>=2) beginViewerPinch(event.touches[0],event.touches[1]);
+  else if(event.touches.length===1) beginViewerTouch(event.touches[0]);
+}
+function handleViewerTouchMove(event){
+  const image=viewerImage(); if(!image||!event.touches.length) return;
+  event.preventDefault();
+  if(event.touches.length>=2){
+    if(viewerGesture.mode!=='pinch') beginViewerPinch(event.touches[0],event.touches[1]);
+    const first=event.touches[0],second=event.touches[1],midpoint=touchMidpoint(first,second);
+    const nextScale=Math.max(1,Math.min(5,viewerGesture.startScale*touchDistance(first,second)/viewerGesture.startDistance));
+    const ratio=nextScale/viewerGesture.startScale; const bounds=document.querySelector('#viewerStage').getBoundingClientRect();
+    const centerX=bounds.left+bounds.width/2; const centerY=bounds.top+bounds.height/2;
+    viewerGesture.scale=nextScale;
+    viewerGesture.x=midpoint.x-centerX-ratio*(viewerGesture.startMidX-centerX-viewerGesture.baseX);
+    viewerGesture.y=midpoint.y-centerY-ratio*(viewerGesture.startMidY-centerY-viewerGesture.baseY);
+    applyViewerTransform(false); return;
+  }
+  const touch=event.touches[0]; viewerGesture.deltaX=touch.clientX-viewerGesture.startX; viewerGesture.deltaY=touch.clientY-viewerGesture.startY;
+  viewerGesture.moved=viewerGesture.moved||Math.hypot(viewerGesture.deltaX,viewerGesture.deltaY)>8;
+  if(viewerGesture.mode==='pan'){
+    viewerGesture.x=viewerGesture.baseX+viewerGesture.deltaX; viewerGesture.y=viewerGesture.baseY+viewerGesture.deltaY;
+    applyViewerTransform(false);
+  }else if(viewerGesture.mode==='swipe'&&Math.abs(viewerGesture.deltaX)>Math.abs(viewerGesture.deltaY)){
+    viewerGesture.x=viewerGesture.deltaX*.65; applyViewerTransform(false,false);
+  }
+}
+function handleViewerTouchEnd(event){
+  if(!viewerImage()) return;
+  event.preventDefault();
+  if(event.touches.length>=2){ beginViewerPinch(event.touches[0],event.touches[1]); return; }
+  if(event.touches.length===1){ beginViewerTouch(event.touches[0],viewerGesture.mode==='pinch'); return; }
+  const ended=event.changedTouches[0]; const wasSwipe=viewerGesture.mode==='swipe';
+  const threshold=Math.min(90,document.querySelector('#viewerStage').clientWidth*.16);
+  if(wasSwipe&&Math.abs(viewerGesture.deltaX)>threshold&&Math.abs(viewerGesture.deltaX)>Math.abs(viewerGesture.deltaY)*1.25){
+    const direction=viewerGesture.deltaX<0?1:-1; resetViewerTransform(); move(direction); return;
+  }
+  if(!viewerGesture.moved&&ended) registerViewerTap(ended);
+  if(viewerGesture.scale<1.08){ viewerGesture.scale=1; viewerGesture.x=0; viewerGesture.y=0; }
+  viewerGesture.mode=''; applyViewerTransform(true);
+}
+
 function openViewer(index){
   if(index<0||index>=state.items.length) return;
   state.current=index; const item=state.items[index];
@@ -238,9 +341,11 @@ function openViewer(index){
   document.querySelector('#favoriteCurrent').textContent=item.favorite?'♥':'♡';
   document.querySelector('#albumCurrent').classList.toggle('active',item.albumIds.length>0);
   stopViewerMedia();
-  document.querySelector('#viewerStage').innerHTML=item.type==='image'
-    ? `<img src="${item.mediaUrl}" alt="${escapeHtml(item.title||item.name)}">`
+  const stage=document.querySelector('#viewerStage'); stage.classList.toggle('is-image',item.type==='image');
+  stage.innerHTML=item.type==='image'
+    ? `<img src="${item.mediaUrl}" alt="${escapeHtml(item.title||item.name)}" draggable="false">`
     : `<video src="${item.mediaUrl}" poster="${item.thumbUrl}" controls autoplay playsinline preload="metadata"></video>`;
+  resetViewerTransform();
   loadViewerPeople(item);
   if(item.type==='video'&&!item.videoCompatible) toast('При необходимости готовим совместимую копию видео…');
   if(!viewer.open) viewer.showModal();
@@ -304,7 +409,7 @@ async function resetMetadata(){
 function stopViewerMedia(){
   const stage=document.querySelector('#viewerStage'); const video=stage.querySelector('video');
   if(video){ video.pause(); video.removeAttribute('src'); video.load(); }
-  stage.replaceChildren();
+  stage.classList.remove('is-image'); stage.replaceChildren();
 }
 function closeViewer(){ stopViewerMedia(); if(viewer.open) viewer.close(); }
 
@@ -661,6 +766,14 @@ document.querySelector('#prevItem').addEventListener('click',()=>move(-1));
 document.querySelector('#nextItem').addEventListener('click',()=>move(1));
 document.querySelector('#favoriteCurrent').addEventListener('click',toggleFavorite);
 document.querySelector('#albumCurrent').addEventListener('click',openAlbumPicker);
+const viewerStage=document.querySelector('#viewerStage');
+viewerStage.addEventListener('touchstart',handleViewerTouchStart,{passive:false});
+viewerStage.addEventListener('touchmove',handleViewerTouchMove,{passive:false});
+viewerStage.addEventListener('touchend',handleViewerTouchEnd,{passive:false});
+viewerStage.addEventListener('touchcancel',handleViewerTouchEnd,{passive:false});
+for(const eventName of ['gesturestart','gesturechange','gestureend']){
+  viewer.addEventListener(eventName,event=>{ if(viewerImage()) event.preventDefault(); },{passive:false});
+}
 document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>document.querySelector('#'+button.dataset.close).close()));
 document.querySelector('#smartDialog').addEventListener('close',()=>clearTimeout(state.smartTimer));
 
