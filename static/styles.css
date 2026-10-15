@@ -5,7 +5,7 @@ html { background:var(--bg); scroll-behavior:smooth; }
 body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
 button,input { font:inherit; }
 button,a { -webkit-tap-highlight-color:transparent; }
-.topbar { height:72px; padding:0 clamp(20px,4vw,64px); display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; background:color-mix(in srgb,var(--bg) 88%,transparent); backdrop-filter:blur(18px); }
+.topbar { height:72px; padding:0 clamp(20px,4vw,64px); display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; isolation:isolate; background:var(--bg); }
 .brand { display:flex; gap:12px; align-items:center; color:var(--text); text-decoration:none; font-weight:650; letter-spacing:-.02em; }
 .brand-mark { width:30px; height:30px; display:grid; place-items:center; border:1px solid #5d604f; border-radius:50%; color:var(--accent); }
 .header-actions,.viewer-actions { display:flex; gap:8px; }
@@ -36,7 +36,7 @@ h1 em { color:var(--muted); font-weight:400; }
 .gallery { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:clamp(4px,.6vw,10px); }
 .month-title { grid-column:1/-1; padding:36px 0 12px; display:flex; align-items:baseline; gap:14px; font-family:Georgia,serif; font-size:28px; }
 .month-title span { color:var(--muted); font:11px Inter,sans-serif; letter-spacing:.14em; text-transform:uppercase; }
-.tile { margin:0; min-width:0; aspect-ratio:1; position:relative; overflow:hidden; background:var(--panel); cursor:zoom-in; }
+.tile { margin:0; min-width:0; aspect-ratio:1; position:relative; overflow:hidden; contain:paint; background:var(--panel); cursor:zoom-in; }
 .tile:nth-of-type(7n+2),.tile:nth-of-type(7n+5) { grid-row:span 2; aspect-ratio:auto; }
 .tile img,.tile>video { width:100%; height:100%; object-fit:cover; display:block; transition:transform .55s cubic-bezier(.2,.7,.2,1),opacity .3s; }
 .tile img { opacity:0; }

@@ -69,22 +69,31 @@ async function load(reset=false){
     if(response.status===401){ location.replace('/login'); return; }
     if(!response.ok) throw new Error('Ошибка загрузки');
     const data=await response.json();
+    const renderFrom=state.items.length;
     state.items.push(...data.items); state.total=data.total; state.offset+=data.items.length; state.hasMore=data.hasMore;
-    render();
+    render(renderFrom);
   }catch(error){
-    if(error.name!=='AbortError') gallery.innerHTML=`<div class="empty"><h2>Не удалось загрузить фотографии</h2><p>${escapeHtml(error.message)}</p></div>`;
+    if(error.name!=='AbortError'){
+      if(state.items.length) toast('Не удалось загрузить следующую часть галереи');
+      else gallery.innerHTML=`<div class="empty"><h2>Не удалось загрузить фотографии</h2><p>${escapeHtml(error.message)}</p></div>`;
+    }
   }finally{
     if(state.controller===controller){ state.loading=false; sentinel.hidden=!state.hasMore; }
   }
 }
 
-function render(){
-  gallery.innerHTML=''; let lastMonth='';
-  for(const item of state.items){
+function render(from=0){
+  from=Math.max(0,Math.min(from,state.items.length));
+  if(from===0) gallery.innerHTML='';
+  const fragment=document.createDocumentFragment();
+  const previous=from?state.items[from-1]:null;
+  let lastMonth=previous?(previous.dateSource==='modified'?'undated':previous.month):'';
+  for(let index=from;index<state.items.length;index++){
+    const item=state.items[index];
     const isUndated=item.dateSource==='modified'; const group=isUndated?'undated':item.month;
     if(group!==lastMonth){
       const title=document.createElement('div'); title.className='month-title';
-      title.innerHTML=isUndated?'Без даты<span>дата съёмки неизвестна</span>':`${months.format(new Date(item.taken))}<span>${item.month}</span>`; gallery.append(title); lastMonth=group;
+      title.innerHTML=isUndated?'Без даты<span>дата съёмки неизвестна</span>':`${months.format(new Date(item.taken))}<span>${item.month}</span>`; fragment.append(title); lastMonth=group;
     }
     const tile=document.createElement('figure'); tile.className='tile'+(state.selected.has(item.id)?' selected':''); tile.dataset.id=item.id;
     const visual=item.type==='image'
@@ -93,9 +102,11 @@ function render(){
     const dateBadge=isUndated?'<span class="tile-date">Без даты</span>':`<time class="tile-date" datetime="${item.taken}">${tileDate.format(new Date(item.taken))}</time>`;
     tile.innerHTML=`${visual}<span class="selection-check">${state.selected.has(item.id)?'✓':''}</span>${item.favorite?'<span class="favorite-badge">♥</span>':''}${dateBadge}<figcaption class="tile-overlay"><span class="tile-name">${escapeHtml(item.name)}</span><span>${size(item.size)}</span></figcaption>`;
     tile.addEventListener('click',()=>state.selecting?toggleSelection(item.id):openViewer(state.items.findIndex(value=>value.id===item.id)));
-    tile.querySelector('img')?.addEventListener('load',event=>event.currentTarget.classList.add('loaded'));
-    gallery.append(tile);
+    const image=tile.querySelector('img');
+    if(image){ if(image.complete) image.classList.add('loaded'); else image.addEventListener('load',event=>event.currentTarget.classList.add('loaded'),{once:true}); }
+    fragment.append(tile);
   }
+  gallery.append(fragment);
   document.querySelector('#empty').hidden=state.items.length>0;
   document.querySelector('#resultCount').textContent=`${state.total.toLocaleString('ru-RU')} файлов`;
   renderCollectionState();
