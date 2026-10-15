@@ -17,6 +17,10 @@ const monthNames = Array.from({length:12},(_,i)=>new Intl.DateTimeFormat('ru-RU'
 const fullDate = new Intl.DateTimeFormat('ru-RU', {day:'numeric', month:'long', year:'numeric', hour:'2-digit', minute:'2-digit'});
 const tileDate = new Intl.DateTimeFormat('ru-RU', {day:'numeric', month:'short', year:'numeric'});
 const size = n => n < 1048576 ? `${Math.round(n/1024)} КБ` : `${(n/1048576).toFixed(1)} МБ`;
+const duration = seconds => {
+  const value=Math.max(0,Math.round(Number(seconds)||0)); const hours=Math.floor(value/3600); const minutes=Math.floor(value%3600/60); const rest=value%60;
+  return hours?`${hours}:${String(minutes).padStart(2,'0')}:${String(rest).padStart(2,'0')}`:`${minutes}:${String(rest).padStart(2,'0')}`;
+};
 
 function debounce(fn, wait=300){ let timer; return (...args) => { clearTimeout(timer); timer=setTimeout(()=>fn(...args),wait); }; }
 function escapeHtml(value){ const div=document.createElement('div'); div.textContent=value??''; return div.innerHTML; }
@@ -98,7 +102,7 @@ function render(from=0){
     const tile=document.createElement('figure'); tile.className='tile'+(state.selected.has(item.id)?' selected':''); tile.dataset.id=item.id;
     const visual=item.type==='image'
       ? `<img loading="lazy" src="${item.thumbUrl}" alt="${escapeHtml(item.title||item.name)}">`
-      : `<video muted preload="metadata" src="${item.mediaUrl}#t=0.1"></video><span class="video-badge">▶</span>`;
+      : `<img loading="lazy" src="${item.thumbUrl}" alt="${escapeHtml(item.title||item.name)}"><span class="video-badge">▶</span>${item.duration!=null?`<span class="video-duration">${duration(item.duration)}</span>`:''}`;
     const dateBadge=isUndated?'<span class="tile-date">Без даты</span>':`<time class="tile-date" datetime="${item.taken}">${tileDate.format(new Date(item.taken))}</time>`;
     tile.innerHTML=`${visual}<span class="selection-check">${state.selected.has(item.id)?'✓':''}</span>${item.favorite?'<span class="favorite-badge">♥</span>':''}${dateBadge}<figcaption class="tile-overlay"><span class="tile-name">${escapeHtml(item.title||item.name)}</span><span>${size(item.size)}</span></figcaption>`;
     tile.addEventListener('click',()=>state.selecting?toggleSelection(item.id):openViewer(state.items.findIndex(value=>value.id===item.id)));
@@ -195,6 +199,8 @@ function openViewer(index){
   document.querySelector('#viewerName').textContent=item.title||item.name;
   const metadata=[item.dateSource==='modified'?'Дата съёмки неизвестна':fullDate.format(new Date(item.taken)),size(item.size)];
   if(item.width&&item.height) metadata.push(`${item.width}×${item.height}`);
+  if(item.type==='video'&&item.duration!=null) metadata.push(duration(item.duration));
+  if(item.type==='video'&&item.videoCodec) metadata.push(item.videoCodec.toUpperCase());
   if(item.cameraModel) metadata.push(item.cameraModel);
   if(item.latitude!=null) metadata.push('есть геопозиция');
   if(item.faceCount) metadata.push(`лиц: ${item.faceCount}`);
@@ -209,7 +215,8 @@ function openViewer(index){
   stopViewerMedia();
   document.querySelector('#viewerStage').innerHTML=item.type==='image'
     ? `<img src="${item.mediaUrl}" alt="${escapeHtml(item.title||item.name)}">`
-    : `<video src="${item.mediaUrl}" controls autoplay playsinline></video>`;
+    : `<video src="${item.mediaUrl}" poster="${item.thumbUrl}" controls autoplay playsinline preload="metadata"></video>`;
+  if(item.type==='video'&&!item.videoCompatible) toast('При необходимости готовим совместимую копию видео…');
   if(!viewer.open) viewer.showModal();
 }
 

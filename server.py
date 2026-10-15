@@ -10,7 +10,9 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -72,8 +74,9 @@ STATIC_FILES = {
 
 def safe_join(root: Path, relative: str) -> Path | None:
     try:
-        target = (root / unquote(relative)).resolve()
-        target.relative_to(root)
+        resolved_root = root.resolve()
+        target = (resolved_root / unquote(relative)).resolve()
+        target.relative_to(resolved_root)
         return target
     except (ValueError, OSError):
         return None
@@ -159,6 +162,10 @@ def image_metadata(path: Path, fallback: datetime, fallback_source: str) -> dict
         "latitude": None,
         "longitude": None,
         "perceptual_hash": None,
+        "duration": None,
+        "video_codec": None,
+        "audio_codec": None,
+        "rotation": None,
     }
     if Image is None:
         return metadata
@@ -186,6 +193,88 @@ def image_metadata(path: Path, fallback: datetime, fallback_source: str) -> dict
     except Exception:
         pass
     return metadata
+
+
+def media_datetime(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def video_metadata(path: Path, fallback: datetime, fallback_source: str) -> dict:
+    metadata = {
+        "taken": fallback,
+        "date_source": fallback_source,
+        "width": None,
+        "height": None,
+        "camera_make": None,
+        "camera_model": None,
+        "latitude": None,
+        "longitude": None,
+        "perceptual_hash": None,
+        "duration": None,
+        "video_codec": None,
+        "audio_codec": None,
+        "rotation": None,
+    }
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return metadata
+    try:
+        process = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-print_format", "json",
+                "-show_format", "-show_streams", str(path),
+            ],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if process.returncode:
+            return metadata
+        payload = json.loads(process.stdout)
+        streams = payload.get("streams") or []
+        video = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+        audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
+        metadata["width"] = int(video["width"]) if video.get("width") else None
+        metadata["height"] = int(video["height"]) if video.get("height") else None
+        metadata["video_codec"] = str(video.get("codec_name") or "")[:40] or None
+        metadata["audio_codec"] = str(audio.get("codec_name") or "")[:40] or None
+        raw_duration = video.get("duration") or (payload.get("format") or {}).get("duration")
+        if raw_duration is not None:
+            metadata["duration"] = round(max(0.0, float(raw_duration)), 3)
+        rotation = (video.get("tags") or {}).get("rotate")
+        for side_data in video.get("side_data_list") or []:
+            if side_data.get("rotation") is not None:
+                rotation = side_data["rotation"]
+                break
+        if rotation is not None:
+            metadata["rotation"] = int(round(float(rotation))) % 360
+        format_tags = (payload.get("format") or {}).get("tags") or {}
+        video_tags = video.get("tags") or {}
+        taken = media_datetime(
+            video_tags.get("creation_time") or format_tags.get("creation_time")
+            or format_tags.get("com.apple.quicktime.creationdate")
+        )
+        if taken:
+            metadata["taken"] = taken
+            metadata["date_source"] = "video_metadata"
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+        pass
+    return metadata
+
+
+def video_browser_compatible(path: Path, video_codec: str | None, audio_codec: str | None) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in {".mp4", ".m4v"}:
+        return video_codec == "h264" and audio_codec in {None, "aac"}
+    if suffix == ".webm":
+        return video_codec in {"vp8", "vp9", "av1"} and audio_codec in {None, "opus", "vorbis"}
+    return False
 
 
 class GalleryDatabase:
@@ -241,6 +330,10 @@ class GalleryDatabase:
                     longitude REAL,
                     content_hash TEXT,
                     perceptual_hash TEXT,
+                    duration REAL,
+                    video_codec TEXT,
+                    audio_codec TEXT,
+                    rotation INTEGER,
                     indexed_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS photos_taken_idx ON photos(taken DESC);
@@ -381,6 +474,17 @@ class GalleryDatabase:
                 connection.execute("ALTER TABLE photos ADD COLUMN content_hash TEXT")
             if "perceptual_hash" not in columns:
                 connection.execute("ALTER TABLE photos ADD COLUMN perceptual_hash TEXT")
+            video_columns_added = False
+            for name, column_type in (
+                ("duration", "REAL"), ("video_codec", "TEXT"),
+                ("audio_codec", "TEXT"), ("rotation", "INTEGER"),
+            ):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE photos ADD COLUMN {name} {column_type}")
+                    video_columns_added = True
+            if video_columns_added:
+                # Existing videos are probed once on the next incremental refresh.
+                connection.execute("UPDATE photos SET mtime_ns=0 WHERE type='video'")
             connection.execute("CREATE INDEX IF NOT EXISTS photos_content_hash_idx ON photos(content_hash)")
             connection.execute("CREATE INDEX IF NOT EXISTS photos_perceptual_hash_idx ON photos(perceptual_hash)")
             now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -631,17 +735,11 @@ class GalleryDatabase:
                 if existing.get(relative) == (stat.st_mtime_ns, stat.st_size):
                     continue
                 fallback, source = filename_date(path, stat)
-                metadata = image_metadata(path, fallback, source) if suffix in IMAGE_EXTENSIONS else {
-                    "taken": fallback,
-                    "date_source": source,
-                    "width": None,
-                    "height": None,
-                    "camera_make": None,
-                    "camera_model": None,
-                    "latitude": None,
-                    "longitude": None,
-                    "perceptual_hash": None,
-                }
+                metadata = (
+                    image_metadata(path, fallback, source)
+                    if suffix in IMAGE_EXTENSIONS
+                    else video_metadata(path, fallback, source)
+                )
                 taken = metadata.pop("taken")
                 changed.append(
                     {
@@ -667,11 +765,13 @@ class GalleryDatabase:
                         INSERT INTO photos (
                             id, path, name, type, size, mtime_ns, taken, date_source,
                             year, month, width, height, camera_make, camera_model,
-                            latitude, longitude, content_hash, perceptual_hash, indexed_at
+                            latitude, longitude, content_hash, perceptual_hash,
+                            duration, video_codec, audio_codec, rotation, indexed_at
                         ) VALUES (
                             :id, :path, :name, :type, :size, :mtime_ns, :taken, :date_source,
                             :year, :month, :width, :height, :camera_make, :camera_model,
-                            :latitude, :longitude, NULL, :perceptual_hash, :indexed_at
+                            :latitude, :longitude, NULL, :perceptual_hash,
+                            :duration, :video_codec, :audio_codec, :rotation, :indexed_at
                         )
                         ON CONFLICT(path) DO UPDATE SET
                             name=excluded.name, type=excluded.type, size=excluded.size,
@@ -681,6 +781,8 @@ class GalleryDatabase:
                             camera_make=excluded.camera_make, camera_model=excluded.camera_model,
                             latitude=excluded.latitude, longitude=excluded.longitude,
                             content_hash=NULL, perceptual_hash=excluded.perceptual_hash,
+                            duration=excluded.duration, video_codec=excluded.video_codec,
+                            audio_codec=excluded.audio_codec, rotation=excluded.rotation,
                             indexed_at=excluded.indexed_at
                         """,
                         changed,
@@ -1320,6 +1422,8 @@ class GalleryDatabase:
         item["month"] = item["taken"][:7]
         item["cameraMake"] = item.pop("camera_make")
         item["cameraModel"] = item.pop("camera_model")
+        item["videoCodec"] = item.pop("video_codec", None)
+        item["audioCodec"] = item.pop("audio_codec", None)
         original_date_source = item.pop("date_source")
         item["originalDateSource"] = original_date_source
         item["dateSource"] = "manual" if item["takenOverridden"] else original_date_source
@@ -1397,6 +1501,14 @@ class GalleryDatabase:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def video_info(self, relative: str) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT path,duration,video_codec,audio_codec FROM photos WHERE path=? AND type='video'",
+                (relative,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def update_photo_metadata(self, photo_id: str, payload: dict, user_id: int | None = None) -> dict:
         if not PHOTO_ID.fullmatch(photo_id):
@@ -1896,6 +2008,104 @@ class GalleryHandler(BaseHTTPRequestHandler):
                         return
         self.send_file(cached, "image/jpeg")
 
+    def video_poster(self, relative: str):
+        relative = unquote(relative)
+        source = safe_join(self.app.photo_root, relative)
+        if not source or not source.is_file() or source.suffix.lower() not in VIDEO_EXTENSIONS:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        stat = source.stat()
+        key = hashlib.sha1(f"poster:{relative}:{stat.st_mtime_ns}:{stat.st_size}".encode()).hexdigest()
+        cached = self.app.cache_dir / "video-posters" / key[:2] / f"{key}.jpg"
+        if not cached.exists():
+            with self.app.video_slots:
+                if not cached.exists():
+                    cached.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = cached.with_name(f".{key}.{threading.get_ident()}.tmp.jpg")
+                    info = self.app.database.video_info(relative) or {}
+                    duration = float(info.get("duration") or 0)
+                    seek = min(10.0, max(0.0, duration * 0.1)) if duration else 1.0
+                    try:
+                        process = subprocess.run(
+                            [
+                                ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-ss", f"{seek:.3f}", "-i", str(source), "-frames:v", "1",
+                                "-vf", "scale=min(960\\,iw):-2", "-q:v", "3", "-y", str(temporary),
+                            ],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120, check=False,
+                        )
+                        if process.returncode or not temporary.is_file() or not temporary.stat().st_size:
+                            raise RuntimeError(process.stderr.decode("utf-8", "ignore")[-500:])
+                        temporary.replace(cached)
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                        temporary.unlink(missing_ok=True)
+                        print(f"Video poster failed for {relative}: {error}", file=sys.stderr, flush=True)
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+        self.send_file(cached, "image/jpeg")
+
+    def video_playback(self, relative: str):
+        relative = unquote(relative)
+        source = safe_join(self.app.photo_root, relative)
+        if not source or not source.is_file() or source.suffix.lower() not in VIDEO_EXTENSIONS:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        info = self.app.database.video_info(relative) or {}
+        ffmpeg = shutil.which("ffmpeg")
+        if (
+            not self.app.video_transcode
+            or video_browser_compatible(source, info.get("video_codec"), info.get("audio_codec"))
+            or not ffmpeg
+        ):
+            self.send_file(source)
+            return
+        stat = source.stat()
+        key = hashlib.sha1(f"playback-v1:{relative}:{stat.st_mtime_ns}:{stat.st_size}:{self.app.video_max_width}".encode()).hexdigest()
+        cached = self.app.cache_dir / "video-playback" / key[:2] / f"{key}.mp4"
+        if not cached.exists():
+            with self.app.video_slots:
+                if not cached.exists():
+                    cached.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = cached.with_name(f".{key}.{threading.get_ident()}.tmp.mp4")
+                    video_codec = info.get("video_codec")
+                    audio_codec = info.get("audio_codec")
+                    command = [
+                        ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+                        "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?",
+                    ]
+                    if video_codec == "h264":
+                        command.extend(["-c:v", "copy"])
+                    else:
+                        command.extend([
+                            "-vf", f"scale=trunc(min({self.app.video_max_width}\\,iw)/2)*2:-2",
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+                        ])
+                    if audio_codec is None:
+                        command.append("-an")
+                    elif audio_codec == "aac":
+                        command.extend(["-c:a", "copy"])
+                    else:
+                        command.extend(["-c:a", "aac", "-b:a", "160k"])
+                    command.extend(["-movflags", "+faststart", "-y", str(temporary)])
+                    try:
+                        process = subprocess.run(
+                            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            timeout=3600, check=False,
+                        )
+                        if process.returncode or not temporary.is_file() or not temporary.stat().st_size:
+                            raise RuntimeError(process.stderr.decode("utf-8", "ignore")[-1000:])
+                        temporary.replace(cached)
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                        temporary.unlink(missing_ok=True)
+                        print(f"Video conversion failed for {relative}: {error}", file=sys.stderr, flush=True)
+                        self.send_file(source)
+                        return
+        self.send_file(cached, "video/mp4")
+
     def face_thumbnail(self, face_id: int):
         try:
             face = self.app.database.face_record(face_id)
@@ -1936,6 +2146,15 @@ class GalleryHandler(BaseHTTPRequestHandler):
     @staticmethod
     def photo_payload(item: dict) -> dict:
         encoded = quote(item["path"], safe="/")
+        if item["type"] == "video":
+            compatible = video_browser_compatible(
+                Path(item["path"]), item.get("videoCodec"), item.get("audioCodec")
+            )
+            return {
+                **item, "mediaUrl": "/video-play/" + encoded,
+                "thumbUrl": "/video-poster/" + encoded,
+                "videoCompatible": compatible,
+            }
         return {**item, "mediaUrl": "/media/" + encoded, "thumbUrl": "/thumb/" + encoded}
 
     def api_photos(self, params: dict):
@@ -2087,6 +2306,12 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 album["coverUrl"] = "/thumb/" + quote(cover, safe="/") if cover else None
                 albums.append(album)
             self.send_json({"albums": albums})
+            return
+        if path.startswith("/video-poster/"):
+            self.video_poster(path[len("/video-poster/"):])
+            return
+        if path.startswith("/video-play/"):
+            self.video_playback(path[len("/video-play/"):])
             return
         if path.startswith("/media/") or path.startswith("/download/"):
             prefix = "/download/" if path.startswith("/download/") else "/media/"
@@ -2342,6 +2567,8 @@ def main():
     smart_delay = max(0.2, float(os.getenv("PHOTO_SMART_DELAY", "1.5")))
     smart_languages = os.getenv("PHOTO_SMART_OCR_LANGUAGES", "rus+eng")[:40]
     smart_timeout = max(5, min(120, int(os.getenv("PHOTO_SMART_OCR_TIMEOUT", "20"))))
+    video_transcode = os.getenv("PHOTO_VIDEO_TRANSCODE", "true").lower() in {"1", "true", "yes"}
+    video_max_width = max(640, min(3840, int(os.getenv("PHOTO_VIDEO_MAX_WIDTH", "1920"))))
     face_model_dir = Path(os.getenv("PHOTO_FACE_MODELS", str(APP_DIR / "models"))).resolve()
     marker_file = os.getenv("PHOTO_MARKER_FILE", ".photodom-storage")
     database = GalleryDatabase(photo_root, Path(args.database), Path(args.backups), marker_file)
@@ -2353,6 +2580,9 @@ def main():
         photo_root=photo_root,
         cache_dir=Path(args.cache).resolve(),
         thumbnail_slots=threading.Semaphore(2),
+        video_slots=threading.Semaphore(1),
+        video_transcode=video_transcode,
+        video_max_width=video_max_width,
         database=database,
         export_dir=export_dir,
         backup_retention=backup_retention,

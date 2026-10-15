@@ -2,15 +2,21 @@ import argparse
 from array import array
 import http.client
 import json
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from urllib.parse import quote
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
-from server import GalleryDatabase, GalleryHandler, GalleryServer, gps_coordinate
+from server import (
+    GalleryDatabase, GalleryHandler, GalleryServer, gps_coordinate,
+    video_browser_compatible,
+)
 
 
 class GalleryDatabaseTests(unittest.TestCase):
@@ -60,6 +66,75 @@ class GalleryDatabaseTests(unittest.TestCase):
         video = next(item for item in self.database.query(0, 10, "", "video")[0])
         self.assertEqual(self.database.set_favorites([photo["id"], video["id"]], True), 2)
         self.assertEqual(self.database.set_album_photos(album["id"], [photo["id"], video["id"]], True), 2)
+
+    def test_video_probe_metadata_and_browser_urls(self):
+        clip = self.root / "camera-clip.mov"
+        clip.write_bytes(b"video-data")
+        probe_payload = {
+            "streams": [
+                {
+                    "codec_type": "video", "codec_name": "hevc", "width": 3840, "height": 2160,
+                    "duration": "12.750", "tags": {"creation_time": "2024-06-07T08:09:10Z"},
+                    "side_data_list": [{"rotation": -90}],
+                },
+                {"codec_type": "audio", "codec_name": "aac"},
+            ],
+            "format": {"duration": "12.750", "tags": {}},
+        }
+        completed = Mock(returncode=0, stdout=json.dumps(probe_payload))
+        with patch("server.shutil.which", return_value="/usr/bin/ffprobe"), patch("server.subprocess.run", return_value=completed):
+            self.database.refresh()
+        video = next(item for item in self.database.query(0, 20, "", "video")[0] if item["name"] == clip.name)
+        self.assertEqual((video["width"], video["height"]), (3840, 2160))
+        self.assertEqual(video["duration"], 12.75)
+        self.assertEqual((video["videoCodec"], video["audioCodec"], video["rotation"]), ("hevc", "aac", 270))
+        self.assertEqual(video["dateSource"], "video_metadata")
+        payload = GalleryHandler.photo_payload(video)
+        self.assertTrue(payload["thumbUrl"].startswith("/video-poster/"))
+        self.assertTrue(payload["mediaUrl"].startswith("/video-play/"))
+        self.assertFalse(payload["videoCompatible"])
+        self.assertTrue(video_browser_compatible(Path("clip.mp4"), "h264", "aac"))
+        self.assertFalse(video_browser_compatible(Path("clip.mov"), "h264", "aac"))
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg is unavailable")
+    def test_video_poster_and_compatible_playback_cache(self):
+        clip = self.root / "sample.mov"
+        generated = subprocess.run(
+            [
+                shutil.which("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=blue:s=320x180:d=1",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                "-c:v", "mpeg4", "-c:a", "pcm_s16le", "-shortest", "-y", str(clip),
+            ],
+            capture_output=True, check=False, timeout=30,
+        )
+        self.assertEqual(generated.returncode, 0, generated.stderr.decode("utf-8", "ignore"))
+        self.database.refresh()
+        cache = Path(self.temporary.name) / "cache"
+        app = argparse.Namespace(
+            photo_root=self.root, cache_dir=cache, database=self.database,
+            video_slots=threading.Semaphore(1), video_transcode=True, video_max_width=1920,
+        )
+        handler = object.__new__(GalleryHandler)
+        handler.server = argparse.Namespace(app=app)
+        sent, errors = [], []
+        handler.send_file = lambda path, content_type=None, **_kwargs: sent.append((Path(path), content_type))
+        handler.send_error = lambda status, *_args, **_kwargs: errors.append(status)
+
+        handler.video_poster("sample.mov")
+        self.assertEqual(errors, [])
+        self.assertTrue(sent[-1][0].is_file())
+        self.assertEqual(sent[-1][1], "image/jpeg")
+
+        handler.video_playback("sample.mov")
+        playback = sent[-1][0]
+        self.assertTrue(playback.is_file())
+        self.assertEqual(sent[-1][1], "video/mp4")
+        inspected = subprocess.run(
+            [shutil.which("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(playback)],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(inspected.stdout.strip(), "h264")
 
     def test_metadata_overrides_search_timeline_location_and_reset(self):
         photo = self.database.query(0, 10, "", "image")[0][0]
