@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 from PIL import Image
 
 from server import (
-    GalleryDatabase, GalleryHandler, GalleryServer, gps_coordinate,
+    PREVIEW_MAX_DIMENSION, GalleryDatabase, GalleryHandler, GalleryServer, gps_coordinate,
     video_browser_compatible,
 )
 
@@ -46,7 +46,41 @@ class GalleryDatabaseTests(unittest.TestCase):
         self.assertEqual(photo["cameraMake"], "Xiaomi")
         self.assertEqual(photo["cameraModel"], "Test Camera")
         self.assertEqual((photo["width"], photo["height"]), (80, 60))
+        payload = GalleryHandler.photo_payload(photo)
+        self.assertTrue(payload["previewUrl"].startswith("/preview/"))
+        self.assertTrue(payload["mediaUrl"].startswith("/media/"))
         self.assertEqual(self.database.refresh()["updated"], 0)
+
+    def test_preview_is_cached_and_does_not_serve_the_original(self):
+        large = self.root / "large.jpg"
+        Image.new("RGB", (2400, 1600), "#527ea3").save(large, quality=95)
+        cache = Path(self.temporary.name) / "cache"
+        app = argparse.Namespace(
+            photo_root=self.root,
+            cache_dir=cache,
+            thumbnail_slots=threading.Semaphore(1),
+        )
+        handler = object.__new__(GalleryHandler)
+        handler.server = argparse.Namespace(app=app)
+        sent, errors = [], []
+        handler.send_file = lambda path, content_type=None, **_kwargs: sent.append((Path(path), content_type))
+        handler.send_error = lambda status, *_args, **_kwargs: errors.append(status)
+
+        handler.preview("large.jpg")
+
+        self.assertEqual(errors, [])
+        preview, content_type = sent[-1]
+        self.assertNotEqual(preview, large)
+        self.assertTrue(preview.is_file())
+        self.assertEqual(content_type, "image/jpeg")
+        with Image.open(preview) as image:
+            self.assertLessEqual(max(image.size), PREVIEW_MAX_DIMENSION)
+            self.assertEqual(image.size, (1920, 1280))
+
+        modified = preview.stat().st_mtime_ns
+        handler.preview("large.jpg")
+        self.assertEqual(sent[-1][0], preview)
+        self.assertEqual(preview.stat().st_mtime_ns, modified)
 
     def test_server_favorites_and_albums(self):
         items, _ = self.database.query(0, 10, "", "image")
@@ -366,7 +400,11 @@ class GalleryDatabaseTests(unittest.TestCase):
             self.assertEqual(status, 200)
             status, data, _ = request("GET", "/api/photos?limit=10&type=image")
             self.assertEqual(status, 200)
-            photo_id = data["items"][0]["id"]
+            photo = data["items"][0]
+            photo_id = photo["id"]
+            self.assertTrue(photo["previewUrl"].startswith("/preview/"))
+            status, _, headers = request("GET", photo["previewUrl"])
+            self.assertEqual((status, headers["Content-Type"]), (200, "image/jpeg"))
             now = "2026-10-15T12:00:00+00:00"
             with self.database.connect() as connection:
                 person_id = connection.execute(

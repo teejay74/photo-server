@@ -52,6 +52,8 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
+PREVIEW_MAX_DIMENSION = 1920
+PREVIEW_JPEG_QUALITY = 82
 DATE_IN_NAME = re.compile(r"(20\d{2})(\d{2})(\d{2})[_-]?(\d{2})?(\d{2})?(\d{2})?")
 PHOTO_ID = re.compile(r"^[0-9a-f]{16}$")
 USERNAME = re.compile(r"^[A-Za-zА-Яа-яЁё0-9_.-]{3,40}$")
@@ -2035,6 +2037,49 @@ class GalleryHandler(BaseHTTPRequestHandler):
                         return
         self.send_file(cached, "image/jpeg")
 
+    def preview(self, relative: str):
+        source = safe_join(self.app.photo_root, relative)
+        if not source or not source.is_file() or source.suffix.lower() not in IMAGE_EXTENSIONS:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if Image is None:
+            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        stat = source.stat()
+        key = hashlib.sha1(
+            f"preview-v1:{relative}:{stat.st_mtime_ns}:{stat.st_size}:"
+            f"{PREVIEW_MAX_DIMENSION}:{PREVIEW_JPEG_QUALITY}".encode()
+        ).hexdigest()
+        cached = self.app.cache_dir / "previews" / key[:2] / f"{key}.jpg"
+        if not cached.exists():
+            with self.app.thumbnail_slots:
+                if not cached.exists():
+                    cached.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = cached.with_name(f"{cached.name}.{threading.get_ident()}.tmp")
+                    try:
+                        with Image.open(source) as image:
+                            image.draft("RGB", (PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION))
+                            image = ImageOps.exif_transpose(image)
+                            image.thumbnail(
+                                (PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION),
+                                Image.Resampling.LANCZOS,
+                            )
+                            if image.mode != "RGB":
+                                image = image.convert("RGB")
+                            image.save(
+                                temporary,
+                                "JPEG",
+                                quality=PREVIEW_JPEG_QUALITY,
+                                optimize=True,
+                                progressive=True,
+                            )
+                        temporary.replace(cached)
+                    except Exception:
+                        temporary.unlink(missing_ok=True)
+                        self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                        return
+        self.send_file(cached, "image/jpeg")
+
     def video_poster(self, relative: str):
         relative = unquote(relative)
         source = safe_join(self.app.photo_root, relative)
@@ -2182,7 +2227,12 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 "thumbUrl": "/video-poster/" + encoded,
                 "videoCompatible": compatible,
             }
-        return {**item, "mediaUrl": "/media/" + encoded, "thumbUrl": "/thumb/" + encoded}
+        return {
+            **item,
+            "mediaUrl": "/media/" + encoded,
+            "previewUrl": "/preview/" + encoded,
+            "thumbUrl": "/thumb/" + encoded,
+        }
 
     def api_photos(self, params: dict):
         try:
@@ -2353,6 +2403,9 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/video-play/"):
             self.video_playback(path[len("/video-play/"):])
+            return
+        if path.startswith("/preview/"):
+            self.preview(path[len("/preview/"):])
             return
         if path.startswith("/media/") or path.startswith("/download/"):
             prefix = "/download/" if path.startswith("/download/") else "/media/"

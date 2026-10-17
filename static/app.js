@@ -343,7 +343,7 @@ function openViewer(index){
   stopViewerMedia();
   const stage=document.querySelector('#viewerStage'); stage.classList.toggle('is-image',item.type==='image');
   stage.innerHTML=item.type==='image'
-    ? `<img src="${item.mediaUrl}" alt="${escapeHtml(item.title||item.name)}" draggable="false">`
+    ? `<img src="${item.previewUrl||item.mediaUrl}" alt="${escapeHtml(item.title||item.name)}" draggable="false">`
     : `<video src="${item.mediaUrl}" poster="${item.thumbUrl}" controls autoplay playsinline preload="metadata"></video>`;
   resetViewerTransform();
   loadViewerPeople(item);
