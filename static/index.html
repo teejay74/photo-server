@@ -6,12 +6,12 @@
   <meta name="theme-color" content="#0d0e10">
   <title>ФотоДом</title>
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css?v=1.9.4">
-  <link rel="stylesheet" href="/static/styles.css?v=20">
+  <link rel="stylesheet" href="/static/styles.css?v=21">
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="/" aria-label="В начало">
-      <span class="brand-mark">◉</span><span>Мои фотографии</span>
+      <span class="brand-mark">●</span><span>ФотоДом</span>
     </a>
     <div class="header-actions">
       <button class="icon-button" id="smartButton" title="Умный каталог" aria-label="Открыть умный каталог">✦</button>
@@ -23,7 +23,7 @@
       <button class="icon-button" id="selectButton" title="Выбрать несколько" aria-label="Выбрать несколько фотографий">✓</button>
       <button class="icon-button" id="favoritesButton" title="Избранное" aria-label="Показать избранное">♡</button>
       <button class="icon-button account-button" id="accountButton" title="Аккаунт" aria-label="Открыть аккаунт">●</button>
-      <button class="icon-button" id="searchButton" title="Поиск" aria-label="Открыть поиск">⌕</button>
+      <button class="icon-button" id="searchButton" title="Поиск" aria-label="Открыть поиск" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"></circle><path d="m16 16 4 4"></path></svg></button>
     </div>
   </header>
 
@@ -46,6 +46,11 @@
           <button class="tab" data-type="image">Фото</button>
           <button class="tab" data-type="video">Видео</button>
         </div>
+        <div class="mobile-filter-actions" aria-label="Быстрые фильтры">
+          <button class="mobile-filter" id="mobileFavorites" type="button"><span aria-hidden="true">♡</span> Избранное</button>
+          <button class="mobile-filter" id="mobileYear" type="button" aria-expanded="false"><span aria-hidden="true">◷</span> <b>Годы</b></button>
+          <button class="mobile-filter" id="mobileFilters" type="button"><span aria-hidden="true">≡</span> Фильтр</button>
+        </div>
         <span class="result-count" id="resultCount"></span>
       </div>
       <button class="period-chip" id="periodChip" hidden><span id="periodLabel"></span><b aria-label="Сбросить период">×</b></button>
@@ -63,6 +68,27 @@
     <button class="timeline-undated" id="timelineUndated" title="Файлы без достоверной даты" hidden>Без даты</button>
   </aside>
   <div class="month-picker" id="monthPicker" hidden></div>
+
+  <nav class="mobile-nav" aria-label="Основная навигация">
+    <button class="mobile-nav-button active" id="mobilePhotos" type="button"><span aria-hidden="true">▦</span><b>Фото</b></button>
+    <button class="mobile-nav-button" id="mobileAlbums" type="button"><span aria-hidden="true">▱</span><b>Альбомы</b></button>
+    <button class="mobile-nav-button" id="mobilePeople" type="button"><span aria-hidden="true">♙</span><b>Люди</b></button>
+    <button class="mobile-nav-button" id="mobileMenuButton" type="button"><span aria-hidden="true">•••</span><b>Меню</b></button>
+  </nav>
+
+  <dialog id="mobileMenuDialog" class="mobile-menu-dialog">
+    <section class="mobile-menu-sheet">
+      <header><div><small>ФОТОДОМ</small><h2>Меню</h2></div><button id="closeMobileMenu" type="button" aria-label="Закрыть">×</button></header>
+      <div class="mobile-menu-grid">
+        <button id="mobileToday" type="button"><span>◷</span><b>В этот день</b></button>
+        <button id="mobileMap" type="button"><span>⌖</span><b>Карта</b></button>
+        <button id="mobileSmart" type="button"><span>✦</span><b>Умный каталог</b></button>
+        <button id="mobileDuplicates" type="button"><span>≋</span><b>Дубли</b></button>
+        <button id="mobileSelect" type="button" data-min-role="editor"><span>✓</span><b>Выбрать</b></button>
+        <button id="mobileAccount" type="button"><span>●</span><b>Аккаунт</b></button>
+      </div>
+    </section>
+  </dialog>
 
   <dialog id="viewer" class="viewer">
     <div class="viewer-bar">
@@ -214,6 +240,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/static/vendor/leaflet/leaflet.js?v=1.9.4" defer></script>
-  <script src="/static/app.js?v=20" defer></script>
+  <script src="/static/app.js?v=21" defer></script>
 </body>
 </html>

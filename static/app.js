@@ -138,6 +138,14 @@ function renderCollectionState(){
   document.querySelector('#todayButton').classList.toggle('active',state.onThisDay);
   document.querySelector('#smartButton').classList.toggle('active',Boolean(state.smartFilter));
   document.querySelector('#filtersButton').classList.toggle('active',Boolean(activeFilters));
+  const mobileFavorite=document.querySelector('#mobileFavorites');
+  mobileFavorite.classList.toggle('active',state.favoritesOnly);
+  mobileFavorite.setAttribute('aria-pressed',String(state.favoritesOnly));
+  mobileFavorite.querySelector('span').textContent=state.favoritesOnly?'♥':'♡';
+  document.querySelector('#mobileFilters').classList.toggle('active',Boolean(activeFilters));
+  document.querySelector('#mobileAlbums').classList.toggle('active',Boolean(state.albumId));
+  document.querySelector('#mobilePeople').classList.toggle('active',Boolean(state.personIds.length));
+  document.querySelector('#mobilePhotos').classList.toggle('active',!state.albumId&&!state.personIds.length);
 }
 
 function renderTimeline(){
@@ -152,10 +160,18 @@ function renderTimeline(){
   const chip=document.querySelector('#periodChip'); chip.hidden=!state.year&&!state.undated;
   if(state.undated) document.querySelector('#periodLabel').textContent='Без даты';
   else if(state.year) document.querySelector('#periodLabel').textContent=state.month?`${monthNames[state.month-1]} ${state.year}`:`${state.year} год`;
+  const mobileYear=document.querySelector('#mobileYear');
+  mobileYear.classList.toggle('active',Boolean(state.year||state.undated));
+  mobileYear.querySelector('b').textContent=state.undated?'Без даты':state.year?(state.month?`${monthNames[state.month-1]} ${state.year}`:String(state.year)):'Годы';
+}
+
+function closeMobileTimeline(){
+  document.body.classList.remove('timeline-open');
+  document.querySelector('#mobileYear').setAttribute('aria-expanded','false');
 }
 
 function selectYear(entry,anchor){ state.year=entry.year; state.month=null; state.undated=false; state.onThisDay=false; showMonths(entry,anchor); renderTimeline(); renderCollectionState(); load(true); }
-function selectUndated(){ state.year=null; state.month=null; state.undated=true; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; renderTimeline(); renderCollectionState(); load(true); }
+function selectUndated(){ state.year=null; state.month=null; state.undated=true; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; closeMobileTimeline(); renderTimeline(); renderCollectionState(); load(true); }
 function showMonths(entry,anchor){
   const picker=document.querySelector('#monthPicker');
   picker.innerHTML=`<div class="month-picker-header"><strong>${entry.year}</strong><button aria-label="Закрыть">×</button></div><div class="month-grid"></div>`;
@@ -164,13 +180,24 @@ function showMonths(entry,anchor){
     if(!counts.has(number)) continue;
     const button=document.createElement('button'); button.className='month-button'+(state.month===number?' active':'');
     button.innerHTML=`${monthNames[number-1]}<small>${counts.get(number)}</small>`;
-    button.addEventListener('click',()=>{ state.year=entry.year; state.month=number; state.undated=false; picker.hidden=true; renderTimeline(); load(true); }); grid.append(button);
+    button.addEventListener('click',()=>{ state.year=entry.year; state.month=number; state.undated=false; picker.hidden=true; closeMobileTimeline(); renderTimeline(); load(true); }); grid.append(button);
   }
   picker.querySelector('.month-picker-header button').addEventListener('click',()=>picker.hidden=true);
   picker.hidden=false; const rect=anchor.getBoundingClientRect(); picker.style.top=`${Math.min(innerHeight-picker.offsetHeight-12,Math.max(74,rect.top-30))}px`;
 }
-function clearPeriod(){ state.year=null; state.month=null; state.undated=false; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; renderTimeline(); renderCollectionState(); load(true); }
+function clearPeriod(){ state.year=null; state.month=null; state.undated=false; state.onThisDay=false; document.querySelector('#monthPicker').hidden=true; closeMobileTimeline(); renderTimeline(); renderCollectionState(); load(true); }
 function clearCollection(){ state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; resetPeopleFilter(); state.filters={date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''}; renderCollectionState(); load(true); }
+
+function closeMobileMenu(){ const dialog=document.querySelector('#mobileMenuDialog'); if(dialog.open) dialog.close(); }
+function resetMobileLibrary(){
+  const isDefault=state.type==='all'&&!state.query&&!state.year&&!state.month&&!state.undated&&!state.favoritesOnly&&!state.albumId&&!state.onThisDay&&!state.smartFilter&&!state.personIds.length&&!Object.values(state.filters).some(Boolean);
+  if(isDefault){ scrollTo({top:0,behavior:'smooth'}); return; }
+  state.type='all'; state.query=''; state.year=null; state.month=null; state.undated=false; state.favoritesOnly=false; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName='';
+  resetPeopleFilter(); state.filters={date_from:'',date_to:'',camera:'',gps:'',min_mb:'',max_mb:''};
+  document.querySelector('#searchInput').value=''; document.querySelector('.tab.active')?.classList.remove('active'); document.querySelector('.tab[data-type="all"]').classList.add('active');
+  closeMobileTimeline(); document.querySelector('#monthPicker').hidden=true;
+  renderTimeline(); renderCollectionState(); load(true); scrollTo({top:0,behavior:'smooth'});
+}
 
 function toggleSelection(id){
   if(state.selected.has(id)) state.selected.delete(id); else state.selected.add(id);
@@ -724,7 +751,11 @@ async function logout(){
 document.querySelectorAll('.tab').forEach(tab=>tab.addEventListener('click',()=>{
   document.querySelector('.tab.active').classList.remove('active'); tab.classList.add('active'); state.type=tab.dataset.type; load(true);
 }));
-document.querySelector('#searchButton').addEventListener('click',()=>{ document.querySelector('#searchWrap').classList.add('open'); document.querySelector('#searchInput').focus(); });
+document.querySelector('#searchButton').addEventListener('click',event=>{
+  const wrap=document.querySelector('#searchWrap'); const open=wrap.classList.toggle('open');
+  event.currentTarget.setAttribute('aria-expanded',String(open));
+  if(open) document.querySelector('#searchInput').focus();
+});
 document.querySelector('#searchInput').addEventListener('input',debounce(event=>{ state.query=event.target.value; load(true); }));
 document.querySelector('#favoritesButton').addEventListener('click',()=>{ state.favoritesOnly=!state.favoritesOnly; state.albumId=null; state.albumName=''; state.onThisDay=false; state.smartFilter=''; state.smartName=''; resetPeopleFilter(); renderCollectionState(); load(true); });
 document.querySelector('#smartButton').addEventListener('click',openSmartCatalog);
@@ -766,6 +797,24 @@ document.querySelector('#prevItem').addEventListener('click',()=>move(-1));
 document.querySelector('#nextItem').addEventListener('click',()=>move(1));
 document.querySelector('#favoriteCurrent').addEventListener('click',toggleFavorite);
 document.querySelector('#albumCurrent').addEventListener('click',openAlbumPicker);
+document.querySelector('#mobileFavorites').addEventListener('click',()=>document.querySelector('#favoritesButton').click());
+document.querySelector('#mobileFilters').addEventListener('click',openFilters);
+document.querySelector('#mobileYear').addEventListener('click',event=>{
+  const open=document.body.classList.toggle('timeline-open'); event.currentTarget.setAttribute('aria-expanded',String(open));
+  if(!open) document.querySelector('#monthPicker').hidden=true;
+});
+document.querySelector('#mobilePhotos').addEventListener('click',resetMobileLibrary);
+document.querySelector('#mobileAlbums').addEventListener('click',()=>document.querySelector('#albumsButton').click());
+document.querySelector('#mobilePeople').addEventListener('click',openPeople);
+document.querySelector('#mobileMenuButton').addEventListener('click',()=>document.querySelector('#mobileMenuDialog').showModal());
+document.querySelector('#closeMobileMenu').addEventListener('click',closeMobileMenu);
+document.querySelector('#mobileToday').addEventListener('click',()=>{ closeMobileMenu(); document.querySelector('#todayButton').click(); });
+document.querySelector('#mobileMap').addEventListener('click',()=>{ closeMobileMenu(); openMap(); });
+document.querySelector('#mobileSmart').addEventListener('click',()=>{ closeMobileMenu(); openSmartCatalog(); });
+document.querySelector('#mobileDuplicates').addEventListener('click',()=>{ closeMobileMenu(); openDuplicates('exact'); });
+document.querySelector('#mobileSelect').addEventListener('click',()=>{ closeMobileMenu(); setSelecting(!state.selecting); });
+document.querySelector('#mobileAccount').addEventListener('click',()=>{ closeMobileMenu(); openAccount(); });
+document.querySelector('#mobileMenuDialog').addEventListener('click',event=>{ if(event.target===event.currentTarget) closeMobileMenu(); });
 const viewerStage=document.querySelector('#viewerStage');
 viewerStage.addEventListener('touchstart',handleViewerTouchStart,{passive:false});
 viewerStage.addEventListener('touchmove',handleViewerTouchMove,{passive:false});
@@ -778,7 +827,9 @@ document.querySelectorAll('[data-close]').forEach(button=>button.addEventListene
 document.querySelector('#smartDialog').addEventListener('close',()=>clearTimeout(state.smartTimer));
 
 document.addEventListener('keydown',event=>{
-  if(event.key==='Escape'&&document.querySelector('#searchWrap').classList.contains('open')&&!viewer.open) document.querySelector('#searchWrap').classList.remove('open');
+  if(event.key==='Escape'&&document.querySelector('#searchWrap').classList.contains('open')&&!viewer.open){
+    document.querySelector('#searchWrap').classList.remove('open'); document.querySelector('#searchButton').setAttribute('aria-expanded','false');
+  }
   const panelOpen=document.querySelector('.panel-dialog[open]');
   if(viewer.open&&!panelOpen&&event.key==='ArrowLeft') move(-1);
   if(viewer.open&&!panelOpen&&event.key==='ArrowRight') move(1);
